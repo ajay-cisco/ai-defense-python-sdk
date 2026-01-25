@@ -2,6 +2,8 @@ default_agent: agentcore_sre_container
 agents:
   agentcore_sre_direct:
     name: agentcore_sre_direct
+    language: python
+    node_version: null
     entrypoint: /Users/vmuthusu/code/cisco/agentsec copy/examples/3_agent-runtimes/agentcore/direct-deploy/agentcore_app.py
     deployment_type: direct_code_deploy
     runtime_type: PYTHON_3_11
@@ -60,6 +62,8 @@ agents:
     is_generated_by_agentcore_create: false
   agentcore_sre_container:
     name: agentcore_sre_container
+    language: python
+    node_version: null
     entrypoint: container-deploy/agentcore_app.py
     deployment_type: container
     runtime_type: null

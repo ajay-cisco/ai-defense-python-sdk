@@ -51,7 +51,7 @@ agentsec.protect()  # Reads config from .env, patches clients
 #       providers={"openai": {"gateway_url": "https://gateway.../conn", "gateway_api_key": "key"}},
 #       auto_dotenv=False,
 #   )
-from agentsec.exceptions import SecurityPolicyError
+from aidefense.runtime.agentsec.exceptions import SecurityPolicyError
 
 print(f"[agentsec] LLM: {os.getenv('AGENTSEC_API_MODE_LLM', 'monitor')} | Integration: {os.getenv('AGENTSEC_LLM_INTEGRATION_MODE', 'api')} | Patched: {agentsec.get_patched_clients()}")
 

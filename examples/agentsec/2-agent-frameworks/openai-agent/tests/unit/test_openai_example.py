@@ -101,7 +101,7 @@ class TestImportOrder:
         for i, line in enumerate(lines):
             if "load_dotenv" in line and "import" not in line:
                 dotenv_line = i
-            if "import agentsec" in line:
+            if "from aidefense.runtime import agentsec" in line:
                 agentsec_line = i
             if "from openai import" in line:
                 openai_line = i
@@ -117,7 +117,7 @@ class TestImportOrder:
         mcp_line = None
         
         for i, line in enumerate(lines):
-            if "import agentsec" in line:
+            if "from aidefense.runtime import agentsec" in line:
                 agentsec_line = i
             if "from mcp" in line:
                 mcp_line = i

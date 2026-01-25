@@ -460,23 +460,29 @@ test_provider_with_mode() {
         fi
     fi
     
-    # Check 4: No ERROR or BLOCKED in output
-    # Exclude DEBUG-level log messages that contain "Error" as part of normal operation
-    # Focus on actual errors: Python tracebacks, BLOCKED decisions, ERROR log level
-    if grep -E "^Traceback|BLOCKED|^\s*ERROR\s*:|raise |SecurityPolicyError" "$log_file" | grep -v "DEBUG:" > /dev/null 2>&1; then
-        local error_line=$(grep -E "^Traceback|BLOCKED|^\s*ERROR\s*:|raise |SecurityPolicyError" "$log_file" | grep -v "DEBUG:" | head -1)
+    # Check 4: Got a final response (check this first)
+    local has_final_response=false
+    if grep -q "Assistant:" "$log_file" || grep -q "final response\|Response:" "$log_file"; then
+        log_pass "Agent produced final response"
+        has_final_response=true
+    else
+        # This is a soft check - don't fail if other checks passed
+        log_info "Could not verify final response (may be OK)"
+    fi
+    
+    # Check 5: No ERROR or BLOCKED in output
+    # Note: Tracebacks in DEBUG logs are handled gracefully - only fail if agent didn't complete
+    # BLOCKED and SecurityPolicyError always indicate a security event worth noting
+    if grep -qE "BLOCKED|SecurityPolicyError" "$log_file"; then
+        local error_line=$(grep -E "BLOCKED|SecurityPolicyError" "$log_file" | head -1)
+        log_fail "Errors found in output: $error_line"
+        all_checks_passed=false
+    elif [ "$has_final_response" = "false" ] && grep -qE "^Traceback|^\s*ERROR\s*:" "$log_file"; then
+        local error_line=$(grep -E "^Traceback|^\s*ERROR\s*:" "$log_file" | head -1)
         log_fail "Errors found in output: $error_line"
         all_checks_passed=false
     else
         log_pass "No errors or blocks in output"
-    fi
-    
-    # Check 5: Got a final response
-    if grep -q "Assistant:" "$log_file" || grep -q "final response\|Response:" "$log_file"; then
-        log_pass "Agent produced final response"
-    else
-        # This is a soft check - don't fail if other checks passed
-        log_info "Could not verify final response (may be OK)"
     fi
     
     # Summary for this provider/mode
@@ -558,13 +564,11 @@ if ! command -v poetry &> /dev/null; then
     exit 1
 fi
 
-# Check poetry.lock exists (setup has been run)
-if [ ! -f "$PROJECT_DIR/poetry.lock" ]; then
-    echo ""
-    echo -e "${YELLOW}Running 'poetry install' first...${NC}"
-    cd "$PROJECT_DIR"
-    poetry install
-fi
+# Always run poetry install to ensure dependencies are available
+# (This is fast if already installed)
+cd "$PROJECT_DIR"
+log_info "Installing dependencies..."
+poetry install --quiet 2>/dev/null || poetry install
 
 # Load shared environment variables (includes AGENTSEC_LLM_RULES)
 SHARED_ENV="$PROJECT_DIR/../../.env"

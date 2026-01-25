@@ -25,11 +25,10 @@ if ! command -v poetry &> /dev/null; then
 fi
 
 # Ensure poetry dependencies are installed
-if [ ! -f "$SIMPLE_DIR/poetry.lock" ]; then
-    echo "Running 'poetry install' first..."
-    cd "$SIMPLE_DIR"
-    poetry install
-fi
+# Always run poetry install to ensure virtualenv exists with all dependencies
+echo "Ensuring dependencies are installed..."
+cd "$SIMPLE_DIR"
+poetry install --quiet 2>/dev/null || poetry install
 
 # Load shared environment variables from project .env
 if [ -f "$PROJECT_DIR/examples/agentsec/.env" ]; then
@@ -93,7 +92,8 @@ run_test_with_mode() {
     local log_file=$(mktemp)
     
     # Run and capture output
-    output=$(cd "$PROJECT_DIR" && \
+    # Run from SIMPLE_DIR to use the correct virtualenv with all dependencies
+    output=$(cd "$SIMPLE_DIR" && \
         AGENTSEC_LLM_INTEGRATION_MODE="$llm_mode" \
         AGENTSEC_MCP_INTEGRATION_MODE="$mcp_mode" \
         AGENTSEC_LOG_LEVEL="DEBUG" \
@@ -217,7 +217,7 @@ verify_protection_with_mode() {
     echo -e "${CYAN}  Verifying protection mode...${NC}"
     
     local output
-    output=$(cd "$PROJECT_DIR" && \
+    output=$(cd "$SIMPLE_DIR" && \
         AGENTSEC_LLM_INTEGRATION_MODE="$llm_mode" \
         AGENTSEC_MCP_INTEGRATION_MODE="$mcp_mode" \
         AGENTSEC_LOG_LEVEL="DEBUG" \
@@ -269,13 +269,14 @@ echo "=============================================="
 echo ""
 
 # Test each example in both modes
-run_example_tests "basic_protection.py" "examples/agentsec/1-simple/basic_protection.py"
-run_example_tests "openai_example.py" "examples/agentsec/1-simple/openai_example.py"
-run_example_tests "streaming_example.py" "examples/agentsec/1-simple/streaming_example.py"
-run_example_tests "mcp_example.py" "examples/agentsec/1-simple/mcp_example.py"
-run_example_tests "gateway_mode_example.py" "examples/agentsec/1-simple/gateway_mode_example.py"
-run_example_tests "skip_inspection_example.py" "examples/agentsec/1-simple/skip_inspection_example.py"
-run_example_tests "simple_strands_bedrock.py" "examples/agentsec/1-simple/simple_strands_bedrock.py"
+# Script paths are relative to SIMPLE_DIR since we run from there
+run_example_tests "basic_protection.py" "basic_protection.py"
+run_example_tests "openai_example.py" "openai_example.py"
+run_example_tests "streaming_example.py" "streaming_example.py"
+run_example_tests "mcp_example.py" "mcp_example.py"
+run_example_tests "gateway_mode_example.py" "gateway_mode_example.py"
+run_example_tests "skip_inspection_example.py" "skip_inspection_example.py"
+run_example_tests "simple_strands_bedrock.py" "simple_strands_bedrock.py"
 
 echo "=============================================="
 echo "  Test Results Summary"

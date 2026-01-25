@@ -25,6 +25,12 @@ echo "  Running All Unit Tests"
 echo -e "==============================================${NC}"
 echo ""
 
+# Install dependencies
+echo "Installing dependencies..."
+poetry install --with dev --quiet
+echo -e "${GREEN}Dependencies installed.${NC}"
+echo ""
+
 # Collect all unit test directories
 UNIT_TEST_DIRS=(
     "aidefense/tests"

@@ -224,9 +224,8 @@ def create_agents(llm_config):
         llm_config=llm_config,
         system_message="""You are a helpful assistant with access to the fetch_url tool.
 
-CRITICAL INSTRUCTIONS:
-1. When the user asks to fetch a URL, you MUST use the fetch_tool function.
-2. After fetching, summarize the content for the user.
+When the user asks to fetch a URL, use the fetch_tool function.
+After fetching, summarize the content for the user.
 
 Tool: fetch_tool(url='https://example.com')
 

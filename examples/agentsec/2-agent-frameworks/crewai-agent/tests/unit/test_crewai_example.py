@@ -97,7 +97,7 @@ class TestImportOrder:
         for i, line in enumerate(lines):
             if "load_dotenv" in line and "import" not in line:
                 dotenv_line = i
-            if "import agentsec" in line:
+            if "from aidefense.runtime import agentsec" in line:
                 agentsec_line = i
         
         assert dotenv_line is not None, "Should call load_dotenv()"
@@ -111,7 +111,7 @@ class TestImportOrder:
         crewai_line = None
         
         for i, line in enumerate(lines):
-            if "import agentsec" in line:
+            if "from aidefense.runtime import agentsec" in line:
                 agentsec_line = i
             if "from crewai import" in line:
                 crewai_line = i

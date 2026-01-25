@@ -44,7 +44,7 @@ agentsec.protect()  # Reads config from .env, patches clients
 #       providers={"openai": {"gateway_url": "https://gateway.../conn", "gateway_api_key": "key"}},
 #       auto_dotenv=False,
 #   )
-from agentsec.exceptions import SecurityPolicyError
+from aidefense.runtime.agentsec.exceptions import SecurityPolicyError
 
 print(f"[agentsec] LLM: {os.getenv('AGENTSEC_API_MODE_LLM', 'monitor')} | Integration: {os.getenv('AGENTSEC_LLM_INTEGRATION_MODE', 'api')} | Patched: {agentsec.get_patched_clients()}")
 
@@ -202,12 +202,15 @@ async def run_agent(initial_message: str = None):
     # System prompt for fetch tool
     system_prompt = """You are a helpful assistant with access to the fetch_url tool.
 
-CRITICAL INSTRUCTIONS:
-1. When asked to fetch or get content from a URL, you MUST use the fetch_url tool
-2. ALWAYS use the tool when the user asks about a URL or webpage
-3. After fetching, summarize the content for the user
+Your primary function is to retrieve web content when users ask about URLs.
 
-Tool usage: fetch_url(url='https://example.com')
+When a user asks you to fetch a URL or asks about a webpage:
+1. Use the fetch_url tool to retrieve the content
+2. Summarize what you found for the user
+
+The fetch_url tool accepts a URL parameter: fetch_url(url='https://example.com')
+
+Always use the tool to get actual content rather than guessing what a page contains.
 """
     
     print("[DEBUG] Creating Agent instance...", flush=True)
