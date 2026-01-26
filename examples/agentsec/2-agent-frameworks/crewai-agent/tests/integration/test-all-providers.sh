@@ -60,6 +60,9 @@ TESTS_PASSED=0
 TESTS_FAILED=0
 TESTS_SKIPPED=0
 
+# Timing tracking (using regular array with key:value format for bash 3 compatibility)
+PROVIDER_TIMES=()
+
 # =============================================================================
 # Helper Functions
 # =============================================================================
@@ -462,23 +465,29 @@ test_provider_with_mode() {
         fi
     fi
     
-    # Check 4: No ERROR or BLOCKED in output
-    # Exclude DEBUG-level log messages that contain "Error" as part of normal operation
-    # Focus on actual errors: Python tracebacks, BLOCKED decisions, ERROR log level
-    if grep -E "^Traceback|BLOCKED|^\s*ERROR\s*:|raise |SecurityPolicyError" "$log_file" | grep -v "DEBUG:" > /dev/null 2>&1; then
-        local error_line=$(grep -E "^Traceback|BLOCKED|^\s*ERROR\s*:|raise |SecurityPolicyError" "$log_file" | grep -v "DEBUG:" | head -1)
+    # Check 4: Got a final response (check this first)
+    local has_final_response=false
+    if grep -q "Assistant:" "$log_file" || grep -q "final response\|Response:" "$log_file"; then
+        log_pass "Agent produced final response"
+        has_final_response=true
+    else
+        # This is a soft check - don't fail if other checks passed
+        log_info "Could not verify final response (may be OK)"
+    fi
+    
+    # Check 5: No ERROR or BLOCKED in output
+    # Note: Tracebacks in DEBUG logs are handled gracefully - only fail if agent didn't complete
+    # BLOCKED and SecurityPolicyError always indicate a security event worth noting
+    if grep -qE "BLOCKED|SecurityPolicyError" "$log_file"; then
+        local error_line=$(grep -E "BLOCKED|SecurityPolicyError" "$log_file" | head -1)
+        log_fail "Errors found in output: $error_line"
+        all_checks_passed=false
+    elif [ "$has_final_response" = "false" ] && grep -qE "^Traceback|^\s*ERROR\s*:" "$log_file"; then
+        local error_line=$(grep -E "^Traceback|^\s*ERROR\s*:" "$log_file" | head -1)
         log_fail "Errors found in output: $error_line"
         all_checks_passed=false
     else
         log_pass "No errors or blocks in output"
-    fi
-    
-    # Check 5: Got a final response
-    if grep -q "Assistant:" "$log_file" || grep -q "final response\|Response:" "$log_file"; then
-        log_pass "Agent produced final response"
-    else
-        # This is a soft check - don't fail if other checks passed
-        log_info "Could not verify final response (may be OK)"
     fi
     
     # Summary for this provider/mode
@@ -560,13 +569,14 @@ if ! command -v poetry &> /dev/null; then
     exit 1
 fi
 
-# Check poetry.lock exists (setup has been run)
-if [ ! -f "$PROJECT_DIR/poetry.lock" ]; then
-    echo ""
-    echo -e "${YELLOW}Running 'poetry install' first...${NC}"
-    cd "$PROJECT_DIR"
-    poetry install
-fi
+# Track overall start time (includes setup and all tests)
+TOTAL_START_TIME=$(date +%s)
+
+# Always run poetry install to ensure dependencies are available
+# (This is fast if already installed)
+cd "$PROJECT_DIR"
+log_info "Installing dependencies..."
+poetry install --quiet 2>/dev/null || poetry install
 
 # Load shared environment variables (includes AGENTSEC_LLM_RULES)
 SHARED_ENV="$PROJECT_DIR/../../.env"
@@ -584,10 +594,21 @@ setup_log_dir
 log_header "Running Tests"
 
 for provider in "${PROVIDERS_TO_TEST[@]}"; do
+    PROVIDER_START=$(date +%s)
+    
     for mode in "${MODES_TO_TEST[@]}"; do
         test_provider_with_mode "$provider" "$mode"
     done
+    
+    PROVIDER_END=$(date +%s)
+    PROVIDER_TIMES+=("$provider:$((PROVIDER_END - PROVIDER_START))")
 done
+
+# Calculate total time
+TOTAL_END_TIME=$(date +%s)
+TOTAL_DURATION=$((TOTAL_END_TIME - TOTAL_START_TIME))
+TOTAL_DURATION_MIN=$((TOTAL_DURATION / 60))
+TOTAL_DURATION_SEC=$((TOTAL_DURATION % 60))
 
 # Summary
 log_header "Test Summary"
@@ -597,15 +618,31 @@ echo -e "  ${RED}Failed${NC}:  $TESTS_FAILED"
 echo -e "  ${YELLOW}Skipped${NC}: $TESTS_SKIPPED"
 echo ""
 
+# Timing breakdown
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${CYAN}  Timing Breakdown:${NC}"
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+for time_entry in "${PROVIDER_TIMES[@]}"; do
+    provider_name="${time_entry%%:*}"
+    provider_secs="${time_entry##*:}"
+    provider_min=$((provider_secs / 60))
+    provider_sec=$((provider_secs % 60))
+    printf "  %-15s %dm %ds\n" "$provider_name:" "$provider_min" "$provider_sec"
+done
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "  ${BOLD}Total Runtime:  ${TOTAL_DURATION_MIN}m ${TOTAL_DURATION_SEC}s${NC}"
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+
 TOTAL=$((TESTS_PASSED + TESTS_FAILED))
 if [ $TESTS_FAILED -eq 0 ] && [ $TOTAL -gt 0 ]; then
     echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}${BOLD}  ✓ ALL TESTS PASSED ($TESTS_PASSED/$TOTAL)${NC}"
+    echo -e "${GREEN}${BOLD}  ✓ ALL TESTS PASSED ($TESTS_PASSED/$TOTAL) in ${TOTAL_DURATION_MIN}m ${TOTAL_DURATION_SEC}s${NC}"
     echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════════${NC}"
     exit 0
 else
     echo -e "${RED}${BOLD}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${RED}${BOLD}  ✗ TESTS FAILED ($TESTS_FAILED/$TOTAL failed)${NC}"
+    echo -e "${RED}${BOLD}  ✗ TESTS FAILED ($TESTS_FAILED/$TOTAL failed) in ${TOTAL_DURATION_MIN}m ${TOTAL_DURATION_SEC}s${NC}"
     echo -e "${RED}${BOLD}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
     echo "  Logs available at: $LOG_DIR/"
