@@ -48,6 +48,10 @@ from .bedrock import patch_bedrock
 from .mcp import patch_mcp
 from .vertexai import patch_vertexai
 from .google_genai import patch_google_genai
+from .cohere import patch_cohere
+from .mistral import patch_mistral
+from .litellm import patch_litellm
+from .azure_ai_inference import patch_azure_ai_inference
 
 __all__ = [
     "is_patched",
@@ -59,6 +63,10 @@ __all__ = [
     "patch_mcp",
     "patch_vertexai",
     "patch_google_genai",
+    "patch_cohere",
+    "patch_mistral",
+    "patch_litellm",
+    "patch_azure_ai_inference",
 ]
 
 

@@ -19,15 +19,23 @@ Usage:
 """
 
 import asyncio
+import logging
 import os
 import sys
 import time
 import warnings
 from pathlib import Path
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+# Configurable timeout from environment
+MCP_TIMEOUT = int(os.getenv("MCP_TIMEOUT", "60"))
+
 # Load shared .env file (before agentsec.protect())
 from dotenv import load_dotenv
-shared_env = Path(__file__).parent.parent / "_shared" / ".env"
+shared_env = Path(__file__).parent.parent.parent / ".env"
 if shared_env.exists():
     load_dotenv(shared_env)
 
@@ -35,25 +43,28 @@ if shared_env.exists():
 # MINIMAL agentsec integration: Just 2 lines!
 # =============================================================================
 from aidefense.runtime import agentsec
-agentsec.protect()  # Reads config from .env, patches clients
+config_path = str(Path(__file__).parent.parent.parent / "agentsec.yaml")
+# Allow integration test script to override YAML integration mode via env vars
+_protect_kwargs = {}
+if os.getenv("AGENTSEC_LLM_INTEGRATION_MODE"):
+    _protect_kwargs["llm_integration_mode"] = os.getenv("AGENTSEC_LLM_INTEGRATION_MODE")
+if os.getenv("AGENTSEC_MCP_INTEGRATION_MODE"):
+    _protect_kwargs["mcp_integration_mode"] = os.getenv("AGENTSEC_MCP_INTEGRATION_MODE")
+agentsec.protect(config=config_path, **_protect_kwargs)
 
 # That's it! Now import your frameworks normally
 #
-# Alternative: Configure Gateway mode programmatically (provider-specific):
-#   agentsec.protect(
-#       llm_integration_mode="gateway",
-#       providers={"openai": {"gateway_url": "https://gateway.../conn", "gateway_api_key": "key"}},
-#       auto_dotenv=False,
-#   )
-from agentsec.exceptions import SecurityPolicyError
+# Alternative: Configure inline (for quick testing):
+#   agentsec.protect(api_mode={"llm": {"mode": "monitor"}})
+from aidefense.runtime.agentsec.exceptions import SecurityPolicyError
 
-print(f"[agentsec] LLM: {os.getenv('AGENTSEC_API_MODE_LLM', 'monitor')} | Integration: {os.getenv('AGENTSEC_LLM_INTEGRATION_MODE', 'api')} | Patched: {agentsec.get_patched_clients()}")
+print(f"[agentsec] Patched: {agentsec.get_patched_clients()}")
 
 # =============================================================================
 # Import shared provider infrastructure
 # =============================================================================
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from _shared import load_config, create_provider
+from _shared import load_config, create_provider, validate_url, URLValidationError
 
 # =============================================================================
 # Import agent libraries (AFTER agentsec.protect())
@@ -88,24 +99,29 @@ async def fetch_url(url: str) -> str:
     Returns:
         The text content of the URL
     """
-    print(f"[DEBUG] fetch_url called: url={url}", flush=True)
-    print(f"\n[TOOL CALL] fetch_url(url='{url}')", flush=True)
+    logger.info(f"fetch_url called: url={url}")
+    
+    # Validate URL to prevent SSRF attacks
+    try:
+        validate_url(url)
+    except URLValidationError as e:
+        logger.warning(f"URL validation failed: {e}")
+        return f"Error: Invalid URL - {e}"
+    
     global _mcp_session
     if _mcp_session is None:
-        print("[DEBUG] MCP not connected!", flush=True)
+        logger.warning("MCP not connected")
         return "Error: MCP not connected"
     
     try:
         start = time.time()
         result = await _mcp_session.call_tool('fetch', {'url': url})
-        content = result.content[0].text if result.content else "No content"
+        content = next((c.text for c in (result.content or []) if hasattr(c, "text")), "No content")
         elapsed = time.time() - start
-        print(f"[TOOL] Got response ({len(content)} chars) in {elapsed:.1f}s", flush=True)
+        logger.info(f"Got response ({len(content)} chars) in {elapsed:.1f}s")
         return content
     except Exception as e:
-        print(f"[TOOL ERROR] {type(e).__name__}: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
+        logger.exception(f"Tool error: {type(e).__name__}: {e}")
         return f"Error: {e}"
 
 
@@ -117,7 +133,7 @@ async def run_agent(initial_message: str = None):
     """Run the LangGraph Agent with MCP tools."""
     global _mcp_session
     
-    print("[DEBUG] run_agent started", flush=True)
+    logger.debug("run_agent started")
     
     # Load configuration and create provider
     try:
@@ -137,8 +153,8 @@ async def run_agent(initial_message: str = None):
     mcp_url = os.getenv("MCP_SERVER_URL")
     model_id = provider.model_id
     
-    print(f"[DEBUG] MCP URL: {mcp_url}", flush=True)
-    print(f"[DEBUG] Model ID: {model_id}", flush=True)
+    logger.debug(f"MCP URL: {mcp_url}")
+    logger.debug(f"Model ID: {model_id}")
     
     # -------------------------------------------------------------------------
     # Connect to MCP if URL configured
@@ -147,47 +163,48 @@ async def run_agent(initial_message: str = None):
     session_context = None
     
     if mcp_url:
-        print(f"[mcp] Connecting to {mcp_url}...", flush=True)
+        logger.info(f"Connecting to MCP server: {mcp_url}")
         try:
-            mcp_context = streamablehttp_client(mcp_url, timeout=60)
-            print("[DEBUG] MCP context created", flush=True)
+            mcp_context = streamablehttp_client(mcp_url, timeout=MCP_TIMEOUT)
+            logger.debug("MCP context created")
             read, write, _ = await mcp_context.__aenter__()
-            print("[DEBUG] MCP context entered", flush=True)
+            logger.debug("MCP context entered")
             session_context = ClientSession(read, write)
             _mcp_session = await session_context.__aenter__()
-            print("[DEBUG] MCP session created", flush=True)
+            logger.debug("MCP session created")
             await _mcp_session.initialize()
-            print("[DEBUG] MCP session initialized", flush=True)
+            logger.debug("MCP session initialized")
             tools_list = await _mcp_session.list_tools()
-            print(f"[mcp] Connected! Tools: {[t.name for t in tools_list.tools]}", flush=True)
+            logger.info(f"MCP connected. Tools: {[t.name for t in tools_list.tools]}")
         except Exception as e:
-            print(f"[mcp] Connection failed: {e}", flush=True)
+            logger.warning(f"MCP connection failed: {e}")
             _mcp_session = None
     
     # -------------------------------------------------------------------------
     # Create LLM instance from provider
     # -------------------------------------------------------------------------
-    print(f"[agent] Creating LLM with model: {model_id}", flush=True)
+    logger.info(f"Creating LLM with model: {model_id}")
     
     llm = provider.get_langchain_llm()
-    print("[DEBUG] LLM created", flush=True)
+    logger.debug("LLM created")
     
     # -------------------------------------------------------------------------
     # Create ReAct agent with tools
     # -------------------------------------------------------------------------
     # Use fetch_url tool (MCP_SERVER_URL points to fetch server)
-    tools = [fetch_url] if _mcp_session else []
-    print(f"[DEBUG] MCP URL: {mcp_url}, Tools: {[t.name if hasattr(t, 'name') else str(t) for t in tools]}", flush=True)
+    # Register tools if MCP URL is configured (tool calls create fresh connections)
+    tools = [fetch_url] if mcp_url else []
+    logger.debug(f"MCP URL: {mcp_url}, Tools: {[t.name if hasattr(t, 'name') else str(t) for t in tools]}")
     
     # Create the ReAct agent graph (suppress deprecation warning)
-    print("[DEBUG] Creating ReAct agent...", flush=True)
+    logger.debug("Creating ReAct agent")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         agent = create_react_agent(
             model=llm,
             tools=tools,
         )
-    print("[DEBUG] ReAct agent created", flush=True)
+    logger.debug("ReAct agent created")
     
     print("\n" + "=" * 60, flush=True)
     print("  LangGraph Agent + agentsec + MCP", flush=True)
@@ -209,13 +226,13 @@ Tool usage: fetch_url(url='https://example.com')
     if initial_message:
         print(f"\nYou: {initial_message}", flush=True)
         try:
-            print("[DEBUG] Calling agent.ainvoke()...", flush=True)
+            logger.debug("Calling agent.ainvoke()")
             start = time.time()
             result = await agent.ainvoke(
                 {"messages": [("system", system_prompt), ("user", initial_message)]}
             )
             elapsed = time.time() - start
-            print(f"[DEBUG] agent.ainvoke() returned in {elapsed:.1f}s", flush=True)
+            logger.debug(f"agent.ainvoke() returned in {elapsed:.1f}s")
             # Extract the final response
             response = result["messages"][-1].content
             print(f"\nAgent: {response}", flush=True)
@@ -247,7 +264,7 @@ Tool usage: fetch_url(url='https://example.com')
             
             print("\nAgent: ", end="", flush=True)
             try:
-                print("[DEBUG] Calling agent.ainvoke()...", flush=True)
+                logger.debug("Calling agent.ainvoke()")
                 result = await agent.ainvoke(
                     {"messages": [("system", system_prompt), ("user", user_input)]}
                 )
@@ -273,17 +290,17 @@ async def cleanup_mcp(session_context, mcp_context):
             await session_context.__aexit__(None, None, None)
     except Exception as e:
         # Log cleanup errors at debug level (expected during shutdown)
-        print(f"[DEBUG] MCP session cleanup: {type(e).__name__}", flush=True)
+        logger.debug(f"MCP session cleanup: {type(e).__name__}")
     try:
         if mcp_context:
             await mcp_context.__aexit__(None, None, None)
     except Exception as e:
-        print(f"[DEBUG] MCP context cleanup: {type(e).__name__}", flush=True)
+        logger.debug(f"MCP context cleanup: {type(e).__name__}")
 
 
 def main():
     """Entry point."""
-    print("[DEBUG] main() started", flush=True)
+    logger.debug("main() started")
     import warnings
     warnings.filterwarnings("ignore", category=RuntimeWarning)
     
@@ -297,19 +314,19 @@ def main():
     
     # Get initial message from command line if provided
     initial_message = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else None
-    print(f"[DEBUG] Initial message: {initial_message}", flush=True)
+    logger.debug(f"Initial message: {initial_message}")
     
     loop = asyncio.new_event_loop()
     loop.set_exception_handler(exception_handler)
     try:
-        print("[DEBUG] Starting event loop...", flush=True)
+        logger.debug("Starting event loop")
         loop.run_until_complete(run_agent(initial_message))
     finally:
         # Suppress shutdown errors
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Error during async generator shutdown: {e}")
         loop.close()
 
 

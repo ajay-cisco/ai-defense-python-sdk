@@ -48,6 +48,11 @@ _inspection_done: ContextVar[bool] = ContextVar(
 _skip_llm: ContextVar[bool] = ContextVar("_skip_llm", default=False)
 _skip_mcp: ContextVar[bool] = ContextVar("_skip_mcp", default=False)
 
+# Active named LLM gateway for context-based routing
+_active_gateway: ContextVar[Optional[str]] = ContextVar(
+    "_active_gateway", default=None
+)
+
 
 def get_inspection_context() -> InspectionContext:
     """
@@ -100,6 +105,53 @@ def merge_metadata(additional: Dict[str, Any]) -> None:
     """
     current = _inspection_metadata.get()
     _inspection_metadata.set({**current, **additional})
+
+
+def set_metadata(
+    user: Optional[str] = None,
+    src_app: Optional[str] = None,
+    client_transaction_id: Optional[str] = None,
+    **extra: Any,
+) -> None:
+    """
+    Set metadata for the current inspection context.
+    
+    This is a convenience function that sets common metadata fields.
+    The metadata will be included in inspection API requests.
+    
+    Args:
+        user: User identifier (e.g., user ID, username)
+        src_app: Source application name
+        client_transaction_id: Client-provided transaction ID for correlation
+        **extra: Additional metadata key-value pairs
+    
+    Example:
+        import agentsec
+        
+        agentsec.set_metadata(
+            user="user-123",
+            src_app="my-agent",
+            client_transaction_id=str(uuid.uuid4()),
+        )
+        
+        # Now make LLM calls - metadata will be included
+        response = client.chat.completions.create(...)
+    """
+    metadata: Dict[str, Any] = {}
+    
+    if user is not None:
+        metadata["user"] = user
+    if src_app is not None:
+        metadata["src_app"] = src_app
+    if client_transaction_id is not None:
+        metadata["client_transaction_id"] = client_transaction_id
+    
+    # Add any extra metadata
+    metadata.update(extra)
+    
+    # Merge into current context
+    if metadata:
+        merge_metadata(metadata)
 
 
 # =============================================================================
@@ -195,10 +247,15 @@ def no_inspection(llm: bool = True, mcp: bool = True) -> Callable[[F], F]:
     """
     Decorator to skip AI Defense inspection for all calls within a function.
     
-    Works with both sync and async functions:
+    Can be used with or without parentheses:
     
-    Sync usage:
+    Without parentheses (skips all inspection):
         @no_inspection
+        def my_health_check():
+            return client.chat.completions.create(...)
+    
+    With parentheses (skips all inspection):
+        @no_inspection()
         def my_health_check():
             return client.chat.completions.create(...)
     
@@ -207,7 +264,7 @@ def no_inspection(llm: bool = True, mcp: bool = True) -> Callable[[F], F]:
         async def my_async_health_check():
             return await client.chat.completions.create(...)
     
-    Granular control:
+    Granular control (parentheses required):
         @no_inspection(llm=True, mcp=False)
         def my_function():
             # Skip LLM inspection only
@@ -220,6 +277,13 @@ def no_inspection(llm: bool = True, mcp: bool = True) -> Callable[[F], F]:
     Returns:
         Decorated function that skips inspection
     """
+    # Support @no_inspection without parentheses: when used as a bare
+    # decorator, the first positional argument ``llm`` receives the
+    # decorated function instead of a bool.
+    if callable(llm):
+        func = llm
+        return no_inspection()(func)  # type: ignore[arg-type]
+
     def decorator(func: F) -> F:
         if asyncio.iscoroutinefunction(func):
             @functools.wraps(func)
@@ -231,6 +295,110 @@ def no_inspection(llm: bool = True, mcp: bool = True) -> Callable[[F], F]:
             @functools.wraps(func)
             def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
                 with skip_inspection(llm=llm, mcp=mcp):
+                    return func(*args, **kwargs)
+            return sync_wrapper  # type: ignore
+    return decorator
+
+
+# =============================================================================
+# Gateway Routing API
+# =============================================================================
+
+def get_active_gateway() -> Optional[str]:
+    """Get the currently active named LLM gateway.
+
+    Returns:
+        The gateway name if inside a ``gateway()`` context, else None.
+    """
+    return _active_gateway.get()
+
+
+class gateway:
+    """Context manager to route LLM calls through a named gateway.
+
+    The gateway name must correspond to a key in
+    ``gateway_mode.llm_gateways`` in the configuration.
+
+    Works with both sync and async code:
+
+    Sync usage::
+
+        with agentsec.gateway("math-gateway"):
+            response = client.chat.completions.create(...)
+
+    Async usage::
+
+        async with agentsec.gateway("math-gateway"):
+            response = await client.chat.completions.create(...)
+
+    Nesting is supported -- the innermost gateway wins::
+
+        with agentsec.gateway("outer"):
+            # uses "outer"
+            with agentsec.gateway("inner"):
+                # uses "inner"
+            # back to "outer"
+
+    Args:
+        name: The name of the LLM gateway to route through.
+    """
+
+    def __init__(self, name: str):
+        self._name = name
+        self._token: Optional[Token[Optional[str]]] = None
+
+    def __enter__(self) -> "gateway":
+        """Enter sync context -- set the active gateway."""
+        self._token = _active_gateway.set(self._name)
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Exit sync context -- restore the previous gateway."""
+        if self._token is not None:
+            _active_gateway.reset(self._token)
+
+    async def __aenter__(self) -> "gateway":
+        """Enter async context -- set the active gateway."""
+        self._token = _active_gateway.set(self._name)
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Exit async context -- restore the previous gateway."""
+        if self._token is not None:
+            _active_gateway.reset(self._token)
+
+
+def use_gateway(name: str) -> Callable[[F], F]:
+    """Decorator to route all LLM calls within a function through a named gateway.
+
+    Works with both sync and async functions::
+
+        @agentsec.use_gateway("math-gateway")
+        def solve_math(problem: str):
+            return client.chat.completions.create(...)
+
+        @agentsec.use_gateway("english-gateway")
+        async def translate(text: str):
+            return await client.chat.completions.create(...)
+
+    Args:
+        name: The name of the LLM gateway to route through.
+
+    Returns:
+        Decorated function that routes calls through the named gateway.
+    """
+
+    def decorator(func: F) -> F:
+        if asyncio.iscoroutinefunction(func):
+            @functools.wraps(func)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                async with gateway(name):
+                    return await func(*args, **kwargs)
+            return async_wrapper  # type: ignore
+        else:
+            @functools.wraps(func)
+            def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+                with gateway(name):
                     return func(*args, **kwargs)
             return sync_wrapper  # type: ignore
     return decorator

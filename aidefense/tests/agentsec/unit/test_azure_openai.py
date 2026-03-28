@@ -49,7 +49,11 @@ class TestAzureOpenAICoverage:
         mock_get_inspector.return_value = mock_inspector
         
         # Setup state
-        _state.set_state(initialized=True, llm_rules=None, api_mode_fail_open_llm=True, api_mode_llm="on_monitor")
+        _state.set_state(
+            initialized=True,
+            llm_rules=None,
+            api_mode={"llm_defaults": {"fail_open": True}, "llm": {"mode": "monitor"}},
+        )
         clear_inspection_context()
         
         # Mock wrapped function
@@ -60,8 +64,10 @@ class TestAzureOpenAICoverage:
         
         # Mock instance (simulating AzureOpenAI's Completions resource)
         mock_instance = MagicMock()
-        # AzureOpenAI-specific attributes
-        mock_instance._client = MagicMock()
+        # AzureOpenAI-specific attributes — use a type whose __name__ is 'AzureOpenAI'
+        # so _detect_provider correctly identifies the provider
+        AzureOpenAI = type("AzureOpenAI", (), {})
+        mock_instance._client = AzureOpenAI()
         mock_instance._client.azure_deployment = "gpt-4-deployment"
         mock_instance._client.api_version = "2024-02-01"
         
@@ -93,7 +99,11 @@ class TestAzureOpenAICoverage:
         mock_get_inspector.return_value = mock_inspector
         
         # Setup state in enforce mode
-        _state.set_state(initialized=True, llm_rules=None, api_mode_fail_open_llm=True, api_mode_llm="on_enforce")
+        _state.set_state(
+            initialized=True,
+            llm_rules=None,
+            api_mode={"llm_defaults": {"fail_open": True}, "llm": {"mode": "enforce"}},
+        )
         clear_inspection_context()
         
         # Mock wrapped function
@@ -123,7 +133,11 @@ class TestAzureOpenAICoverage:
         mock_get_inspector.return_value = mock_inspector
         
         # Setup state
-        _state.set_state(initialized=True, llm_rules=None, api_mode_fail_open_llm=True, api_mode_llm="on_monitor")
+        _state.set_state(
+            initialized=True,
+            llm_rules=None,
+            api_mode={"llm_defaults": {"fail_open": True}, "llm": {"mode": "monitor"}},
+        )
         clear_inspection_context()
         
         # Mock streaming response
@@ -169,7 +183,11 @@ class TestAzureOpenAICoverage:
         mock_get_inspector.return_value = mock_inspector
         
         # Setup state in MONITOR mode (not enforce)
-        _state.set_state(initialized=True, llm_rules=None, api_mode_fail_open_llm=True, api_mode_llm="on_monitor")
+        _state.set_state(
+            initialized=True,
+            llm_rules=None,
+            api_mode={"llm_defaults": {"fail_open": True}, "llm": {"mode": "monitor"}},
+        )
         clear_inspection_context()
         
         # Mock wrapped function

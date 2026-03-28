@@ -28,7 +28,13 @@ if env_file.exists():
 
 # Enable protection before importing MCP client
 from aidefense.runtime import agentsec
-agentsec.protect(api_mode_mcp="on_monitor")  # Use monitor mode for this example
+config_path = str(Path(__file__).parent.parent / "agentsec.yaml")
+agentsec.protect(
+    config=config_path,  # gateway URLs, API endpoints, timeouts
+    llm_integration_mode=os.getenv("AGENTSEC_LLM_INTEGRATION_MODE", "api"),
+    mcp_integration_mode=os.getenv("AGENTSEC_MCP_INTEGRATION_MODE", "api"),
+    api_mode={"mcp": {"mode": "monitor"}},  # override: use monitor mode for MCP
+)
 
 
 async def main() -> None:
@@ -45,7 +51,7 @@ async def main() -> None:
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
     
-    mcp_url = os.environ.get("MCP_SERVER_URL", "https://mcp.deepwiki.com/mcp")
+    mcp_url = os.environ.get("MCP_SERVER_URL", "https://remote.mcpservers.org/fetch/mcp")
     print(f"Connecting to MCP server: {mcp_url}")
     print()
     
@@ -61,15 +67,14 @@ async def main() -> None:
             
             # Make a tool call - this will be inspected by agentsec!
             print("Making tool call (will be inspected by Cisco AI Defense)...")
-            print("  Tool: ask_question")
-            print("  Args: repo=python/cpython, question='What is Python?'")
+            print("  Tool: fetch")
+            print("  Args: url='https://example.com'")
             print()
             
             result = await session.call_tool(
-                "ask_question",
+                "fetch",
                 {
-                    "repoName": "python/cpython",
-                    "question": "What is Python?"
+                    "url": "https://example.com"
                 }
             )
             

@@ -18,11 +18,15 @@ SIMPLE_DIR = Path(__file__).parent.parent.parent
 EXAMPLES = [
     "basic_protection",
     "openai_example",
+    "cohere_example",
+    "mistral_example",
     "streaming_example",
     "mcp_example",
     "simple_strands_bedrock",
     "gateway_mode_example",
     "skip_inspection_example",
+    "multi_gateway_example",
+    "custom_rules_example",
 ]
 
 
@@ -79,10 +83,11 @@ class TestAgentsecIntegration:
         
         assert "agentsec.protect(" in source, f"{example_name}.py should call agentsec.protect()"
 
-    def test_basic_protection_uses_llm_mode(self):
-        """Test basic_protection.py uses llm_mode parameter."""
+    def test_basic_protection_uses_yaml_config(self):
+        """Test basic_protection.py loads agentsec.yaml config."""
         source = (SIMPLE_DIR / "basic_protection.py").read_text()
-        assert "api_mode_llm=" in source
+        assert "config=" in source
+        assert "agentsec.yaml" in source
 
     def test_openai_example_imports_after_protect(self):
         """Test openai_example.py imports OpenAI after protect()."""
@@ -102,9 +107,9 @@ class TestAgentsecIntegration:
         assert "stream=True" in source, "Should demonstrate stream=True parameter"
 
     def test_mcp_example_uses_mcp_mode(self):
-        """Test mcp_example.py uses mcp_mode parameter."""
+        """Test mcp_example.py uses api_mode parameter for MCP."""
         source = (SIMPLE_DIR / "mcp_example.py").read_text()
-        assert "api_mode_mcp=" in source, "Should use api_mode_mcp parameter"
+        assert "api_mode=" in source, "Should use api_mode parameter"
 
     def test_mcp_example_uses_call_tool(self):
         """Test mcp_example.py demonstrates call_tool."""
@@ -182,21 +187,20 @@ class TestGatewayModeExample:
         """Test gateway_mode_example.py shows API mode configuration."""
         source = (SIMPLE_DIR / "gateway_mode_example.py").read_text()
         assert "API MODE" in source, "Should explain API mode"
-        assert "api_mode_llm" in source, "Should show api_mode_llm parameter"
+        assert "api_mode=" in source, "Should show api_mode parameter"
 
     def test_shows_gateway_mode_config(self):
         """Test gateway_mode_example.py shows Gateway mode configuration."""
         source = (SIMPLE_DIR / "gateway_mode_example.py").read_text()
         assert "GATEWAY MODE" in source, "Should explain Gateway mode"
         assert "llm_integration_mode" in source, "Should show llm_integration_mode parameter"
-        assert "providers" in source, "Should show providers parameter"
+        assert "llm_gateways" in source, "Should show llm_gateways parameter"
 
     def test_shows_env_vars(self):
-        """Test gateway_mode_example.py shows environment variables."""
+        """Test gateway_mode_example.py references environment variables for secrets."""
         source = (SIMPLE_DIR / "gateway_mode_example.py").read_text()
-        assert "AI_DEFENSE_API_MODE_LLM_ENDPOINT" in source
-        assert "AGENTSEC_OPENAI_GATEWAY_URL" in source
-        assert "AGENTSEC_LLM_INTEGRATION_MODE" in source
+        assert "AI_DEFENSE_API_MODE_LLM_API_KEY" in source
+        assert "OPENAI_API_KEY" in source
 
     def test_has_example_functions(self):
         """Test gateway_mode_example.py has example functions."""
@@ -267,4 +271,33 @@ class TestStrandsBedrock:
         source = (SIMPLE_DIR / "simple_strands_bedrock.py").read_text()
         assert "load_dotenv" in source
         assert ".env" in source
+
+
+class TestCustomRulesExample:
+    """Tests specific to custom_rules_example.py."""
+
+    def test_uses_rules_parameter(self):
+        """Test custom_rules_example.py uses rules in api_mode."""
+        source = (SIMPLE_DIR / "custom_rules_example.py").read_text()
+        assert '"rules"' in source or "'rules'" in source, \
+            "Should use rules parameter"
+
+    def test_uses_api_mode_override(self):
+        """Test custom_rules_example.py overrides api_mode via protect() kwargs."""
+        source = (SIMPLE_DIR / "custom_rules_example.py").read_text()
+        assert "api_mode=" in source, \
+            "Should override api_mode via protect() kwargs"
+
+    def test_documents_rule_names(self):
+        """Test custom_rules_example.py documents supported rule names."""
+        source = (SIMPLE_DIR / "custom_rules_example.py").read_text()
+        assert "PII" in source, "Should mention PII rule"
+        assert "Prompt Injection" in source, "Should mention Prompt Injection rule"
+        assert "Code Detection" in source, "Should mention Code Detection rule"
+
+    def test_loads_yaml_config(self):
+        """Test custom_rules_example.py loads agentsec.yaml as base config."""
+        source = (SIMPLE_DIR / "custom_rules_example.py").read_text()
+        assert "config=" in source, "Should load YAML config"
+        assert "agentsec.yaml" in source, "Should reference agentsec.yaml"
 

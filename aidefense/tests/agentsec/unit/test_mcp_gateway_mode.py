@@ -12,6 +12,7 @@ import os
 
 from aidefense.runtime.agentsec._state import reset, set_state, get_mcp_integration_mode
 from aidefense.runtime.agentsec._context import clear_inspection_context
+from aidefense.runtime.agentsec.exceptions import SecurityPolicyError
 from aidefense.runtime.agentsec.patchers import reset_registry
 from aidefense.runtime.agentsec.inspectors.gateway_mcp import MCPGatewayInspector
 
@@ -27,7 +28,7 @@ def reset_state():
     clear_inspection_context()
     # Clear cached inspectors
     mcp_patcher._api_inspector = None
-    mcp_patcher._gateway_inspector = None
+    mcp_patcher._gateway_pass_through_inspector = None
     mcp_patcher._gateway_mode_logged = False
     # Clear gateway-related env vars
     for var in ["AGENTSEC_MCP_INTEGRATION_MODE", "AI_DEFENSE_GATEWAY_MODE_MCP_URL", 
@@ -38,7 +39,7 @@ def reset_state():
     reset_registry()
     clear_inspection_context()
     mcp_patcher._api_inspector = None
-    mcp_patcher._gateway_inspector = None
+    mcp_patcher._gateway_pass_through_inspector = None
     mcp_patcher._gateway_mode_logged = False
 
 
@@ -65,10 +66,11 @@ class TestMCPGatewayInspector:
         assert inspector.get_redirect_url() is None
 
     def test_get_headers_with_api_key(self):
-        """Test get_headers returns api-key header."""
+        """Test get_headers returns api-key header when auth_mode is api_key."""
         inspector = MCPGatewayInspector(
             gateway_url="https://gateway.example.com/mcp",
             api_key="test-api-key",
+            auth_mode="api_key",
         )
         
         headers = inspector.get_headers()
@@ -80,6 +82,30 @@ class TestMCPGatewayInspector:
             gateway_url="https://gateway.example.com/mcp",
         )
         
+        headers = inspector.get_headers()
+        assert headers == {}
+
+    def test_get_headers_auth_mode_none_returns_empty(self):
+        """Test get_headers with explicit auth_mode='none' returns empty dict, even with api_key."""
+        inspector = MCPGatewayInspector(
+            gateway_url="https://gateway.example.com/mcp",
+            api_key="some-key",
+            auth_mode="none",
+        )
+
+        headers = inspector.get_headers()
+        assert headers == {}
+
+    def test_get_headers_auth_mode_oauth2_returns_empty(self):
+        """Test get_headers with auth_mode='oauth2_client_credentials' returns empty dict.
+
+        OAuth2 token injection is handled by the MCP patcher, not the inspector.
+        """
+        inspector = MCPGatewayInspector(
+            gateway_url="https://gateway.example.com/mcp",
+            auth_mode="oauth2_client_credentials",
+        )
+
         headers = inspector.get_headers()
         assert headers == {}
 
@@ -127,132 +153,276 @@ class TestMCPGatewayInspector:
 class TestMCPIntegrationModeDetection:
     """Test MCP integration mode detection."""
 
-    def test_is_gateway_mode_default_api(self):
-        """Test default MCP integration mode is 'api'."""
+    def test_should_use_gateway_default_api(self):
+        """Test _should_use_gateway is False when integration mode is 'api'."""
         set_state(
             initialized=True,
-            llm_rules=None,
-            api_mode_llm="on_monitor",
-            api_mode_mcp="on_monitor",
-            llm_integration_mode="api",
             mcp_integration_mode="api",
+            api_mode={"mcp": {"mode": "monitor"}},
         )
-        
-        assert mcp_patcher._is_gateway_mode() is False
         assert get_mcp_integration_mode() == "api"
+        assert mcp_patcher._should_use_gateway() is False
 
-    def test_is_gateway_mode_when_gateway(self):
-        """Test MCP integration mode is 'gateway' when configured."""
+    def test_should_use_gateway_when_gateway_mode(self):
+        """Test _should_use_gateway is True when integration mode is 'gateway' (and not skipped)."""
         set_state(
             initialized=True,
-            llm_rules=None,
-            api_mode_llm="on_monitor",
-            api_mode_mcp="on_monitor",
-            llm_integration_mode="api",
             mcp_integration_mode="gateway",
+            gateway_mode={"mcp_gateways": {"https://mcp.example.com/mcp": {"gateway_url": "https://gateway.example.com/mcp"}}},
+            api_mode={"mcp": {"mode": "monitor"}},
         )
-        
-        assert mcp_patcher._is_gateway_mode() is True
         assert get_mcp_integration_mode() == "gateway"
-
-    def test_should_use_gateway_requires_url(self):
-        """Test gateway mode requires URL to be configured."""
-        set_state(
-            initialized=True,
-            llm_rules=None,
-            api_mode_llm="on_monitor",
-            api_mode_mcp="on_monitor",
-            mcp_integration_mode="gateway",
-            gateway_mode_mcp="on",
-            gateway_mode_mcp_url=None,
-        )
-        
-        assert mcp_patcher._is_gateway_mode() is True
-        assert mcp_patcher._should_use_gateway() is False
-
-    def test_should_use_gateway_requires_mode_on(self):
-        """Test gateway mode requires mode to be 'on'."""
-        set_state(
-            initialized=True,
-            llm_rules=None,
-            api_mode_llm="on_monitor",
-            api_mode_mcp="on_monitor",
-            mcp_integration_mode="gateway",
-            gateway_mode_mcp="off",
-            gateway_mode_mcp_url="https://gateway.example.com/mcp",
-        )
-        
-        assert mcp_patcher._is_gateway_mode() is True
-        assert mcp_patcher._should_use_gateway() is False
-
-    def test_should_use_gateway_with_config(self):
-        """Test gateway mode works when fully configured."""
-        set_state(
-            initialized=True,
-            llm_rules=None,
-            api_mode_llm="on_monitor",
-            api_mode_mcp="on_monitor",
-            mcp_integration_mode="gateway",
-            gateway_mode_mcp="on",
-            gateway_mode_mcp_url="https://gateway.example.com/mcp",
-            gateway_mode_mcp_api_key="test-key",
-        )
-        
-        assert mcp_patcher._is_gateway_mode() is True
         assert mcp_patcher._should_use_gateway() is True
 
 
 class TestMCPGatewayURLRedirection:
     """Test MCP gateway URL redirection via streamablehttp_client patching."""
 
-    def test_wrap_streamablehttp_client_redirects_in_gateway_mode(self):
-        """Test streamablehttp_client wrapper redirects URL when gateway mode enabled."""
+    def test_wrap_streamablehttp_client_redirects_with_per_url_gateway(self):
+        """Test streamablehttp_client redirects when gateway configured for that URL."""
         set_state(
             initialized=True,
-            llm_rules=None,
-            api_mode_llm="on_monitor",
-            api_mode_mcp="on_monitor",
             mcp_integration_mode="gateway",
-            gateway_mode_mcp="on",
-            gateway_mode_mcp_url="https://gateway.example.com/mcp/server/123",
-            gateway_mode_mcp_api_key="test-api-key",
+            gateway_mode={
+                "mcp_gateways": {
+                    "https://original-server.com/mcp": {
+                        "gateway_url": "https://gateway.example.com/mcp/server/123",
+                        "gateway_api_key": "test-api-key",
+                    }
+                }
+            },
+            api_mode={"mcp": {"mode": "monitor"}},
         )
-        
         mock_wrapped = MagicMock(return_value="mock_transport")
-        
         result = mcp_patcher._wrap_streamablehttp_client(
             mock_wrapped, None,
             ("https://original-server.com/mcp",),
             {}
         )
-        
         call_args = mock_wrapped.call_args
         assert call_args[0][0] == "https://gateway.example.com/mcp/server/123"
-        
         headers = call_args[1].get('headers', {})
         assert headers.get('api-key') == "test-api-key"
 
-    def test_wrap_streamablehttp_client_passes_through_in_api_mode(self):
-        """Test streamablehttp_client wrapper passes through in API mode."""
+    def test_wrap_streamablehttp_client_raises_for_unconfigured_url(self):
+        """Test streamablehttp_client raises SecurityPolicyError when no gateway is configured for the URL."""
         set_state(
             initialized=True,
-            llm_rules=None,
-            api_mode_llm="on_monitor",
-            api_mode_mcp="on_monitor",
-            mcp_integration_mode="api",
+            mcp_integration_mode="gateway",
+            gateway_mode={
+                "mcp_gateways": {
+                    "https://configured-server.com/mcp": {
+                        "gateway_url": "https://gateway.example.com/mcp",
+                        "gateway_api_key": "configured-key",
+                    }
+                }
+            },
+            api_mode={"mcp": {"mode": "monitor"}},
         )
-        
+        mock_wrapped = MagicMock(return_value="mock_transport")
+        original_url = "https://other-server.com/mcp"
+        # Must raise instead of silently connecting directly without inspection
+        with pytest.raises(SecurityPolicyError, match="no gateway configuration.*found for URL"):
+            mcp_patcher._wrap_streamablehttp_client(
+                mock_wrapped, None,
+                (original_url,),
+                {}
+            )
+
+    def test_wrap_streamablehttp_client_passes_through_in_api_mode(self):
+        """Test streamablehttp_client passes through in API mode."""
+        set_state(
+            initialized=True,
+            mcp_integration_mode="api",
+            api_mode={"mcp": {"mode": "monitor"}},
+        )
         mock_wrapped = MagicMock(return_value="mock_transport")
         original_url = "https://original-server.com/mcp"
-        
         result = mcp_patcher._wrap_streamablehttp_client(
             mock_wrapped, None,
             (original_url,),
             {}
         )
-        
         call_args = mock_wrapped.call_args
         assert call_args[0][0] == original_url
+
+    def test_wrap_streamablehttp_client_passes_through_when_gateway_off(self):
+        """Test streamablehttp_client passes through when gateway mcp_mode is 'off'."""
+        set_state(
+            initialized=True,
+            mcp_integration_mode="gateway",
+            gateway_mode={
+                "mcp_mode": "off",
+                "mcp_gateways": {
+                    "https://original-server.com/mcp": {
+                        "gateway_url": "https://gateway.example.com/mcp",
+                        "gateway_api_key": "test-key",
+                    },
+                },
+            },
+        )
+        mock_wrapped = MagicMock(return_value="mock_transport")
+        original_url = "https://original-server.com/mcp"
+        result = mcp_patcher._wrap_streamablehttp_client(
+            mock_wrapped, None,
+            (original_url,),
+            {}
+        )
+        call_args = mock_wrapped.call_args
+        assert call_args[0][0] == original_url
+
+    def test_wrap_streamablehttp_client_auth_mode_none_no_headers(self):
+        """Test auth_mode='none' injects no auth headers."""
+        set_state(
+            initialized=True,
+            mcp_integration_mode="gateway",
+            gateway_mode={
+                "mcp_gateways": {
+                    "https://no-auth-server.com/mcp": {
+                        "gateway_url": "https://gateway.example.com/mcp/noauth",
+                        "auth_mode": "none",
+                    }
+                }
+            },
+            api_mode={"mcp": {"mode": "monitor"}},
+        )
+        mock_wrapped = MagicMock(return_value="mock_transport")
+        result = mcp_patcher._wrap_streamablehttp_client(
+            mock_wrapped, None,
+            ("https://no-auth-server.com/mcp",),
+            {}
+        )
+        call_args = mock_wrapped.call_args
+        assert call_args[0][0] == "https://gateway.example.com/mcp/noauth"
+        headers = call_args[1].get('headers', {})
+        assert 'api-key' not in headers
+        assert 'Authorization' not in headers
+
+    def test_wrap_streamablehttp_client_auth_mode_api_key(self):
+        """Test auth_mode='api_key' injects api-key header."""
+        set_state(
+            initialized=True,
+            mcp_integration_mode="gateway",
+            gateway_mode={
+                "mcp_gateways": {
+                    "https://apikey-server.com/mcp": {
+                        "gateway_url": "https://gateway.example.com/mcp/apikey",
+                        "auth_mode": "api_key",
+                        "gateway_api_key": "my-api-key",
+                    }
+                }
+            },
+            api_mode={"mcp": {"mode": "monitor"}},
+        )
+        mock_wrapped = MagicMock(return_value="mock_transport")
+        result = mcp_patcher._wrap_streamablehttp_client(
+            mock_wrapped, None,
+            ("https://apikey-server.com/mcp",),
+            {}
+        )
+        call_args = mock_wrapped.call_args
+        assert call_args[0][0] == "https://gateway.example.com/mcp/apikey"
+        headers = call_args[1].get('headers', {})
+        assert headers.get('api-key') == "my-api-key"
+
+    def test_wrap_streamablehttp_client_auth_mode_oauth2(self):
+        """Test auth_mode='oauth2_client_credentials' injects Authorization Bearer header."""
+        set_state(
+            initialized=True,
+            mcp_integration_mode="gateway",
+            gateway_mode={
+                "mcp_gateways": {
+                    "https://oauth-server.com/mcp": {
+                        "gateway_url": "https://gateway.example.com/mcp/oauth",
+                        "auth_mode": "oauth2_client_credentials",
+                        "oauth2_token_url": "https://auth.example.com/token",
+                        "oauth2_client_id": "test-client-id",
+                        "oauth2_client_secret": "test-client-secret",
+                        "oauth2_scopes": "read",
+                    }
+                }
+            },
+            api_mode={"mcp": {"mode": "monitor"}},
+        )
+        mock_wrapped = MagicMock(return_value="mock_transport")
+        with patch("aidefense.runtime.agentsec._oauth2.get_oauth2_token", return_value="mock-oauth-token") as mock_get_token:
+            result = mcp_patcher._wrap_streamablehttp_client(
+                mock_wrapped, None,
+                ("https://oauth-server.com/mcp",),
+                {}
+            )
+        call_args = mock_wrapped.call_args
+        assert call_args[0][0] == "https://gateway.example.com/mcp/oauth"
+        headers = call_args[1].get('headers', {})
+        assert headers.get('Authorization') == "Bearer mock-oauth-token"
+        assert 'api-key' not in headers
+        mock_get_token.assert_called_once_with(
+            token_url="https://auth.example.com/token",
+            client_id="test-client-id",
+            client_secret="test-client-secret",
+            scopes="read",
+        )
+
+    def test_wrap_streamablehttp_client_backward_compat_no_auth_mode(self):
+        """Test backward compat: api_key present without explicit auth_mode injects api-key header."""
+        set_state(
+            initialized=True,
+            mcp_integration_mode="gateway",
+            gateway_mode={
+                "mcp_gateways": {
+                    "https://legacy-server.com/mcp": {
+                        "gateway_url": "https://gateway.example.com/mcp/legacy",
+                        "gateway_api_key": "legacy-key",
+                        # no auth_mode field — should be inferred as "api_key"
+                    }
+                }
+            },
+            api_mode={"mcp": {"mode": "monitor"}},
+        )
+        mock_wrapped = MagicMock(return_value="mock_transport")
+        result = mcp_patcher._wrap_streamablehttp_client(
+            mock_wrapped, None,
+            ("https://legacy-server.com/mcp",),
+            {}
+        )
+        call_args = mock_wrapped.call_args
+        assert call_args[0][0] == "https://gateway.example.com/mcp/legacy"
+        headers = call_args[1].get('headers', {})
+        assert headers.get('api-key') == "legacy-key"
+
+    def test_wrap_streamablehttp_client_oauth2_token_error_propagates(self):
+        """Test that OAuth2 token fetch errors propagate through the patcher."""
+        from aidefense.runtime.agentsec.exceptions import InspectionNetworkError
+
+        set_state(
+            initialized=True,
+            mcp_integration_mode="gateway",
+            gateway_mode={
+                "mcp_gateways": {
+                    "https://oauth-error-server.com/mcp": {
+                        "gateway_url": "https://gateway.example.com/mcp/oauth-err",
+                        "auth_mode": "oauth2_client_credentials",
+                        "oauth2_token_url": "https://auth.example.com/token",
+                        "oauth2_client_id": "cid",
+                        "oauth2_client_secret": "csecret",
+                    }
+                }
+            },
+            api_mode={"mcp": {"mode": "monitor"}},
+        )
+        mock_wrapped = MagicMock(return_value="mock_transport")
+        with patch(
+            "aidefense.runtime.agentsec._oauth2.get_oauth2_token",
+            side_effect=InspectionNetworkError("OAuth2 token request failed with status 401: Unauthorized"),
+        ):
+            with pytest.raises(InspectionNetworkError, match="401"):
+                mcp_patcher._wrap_streamablehttp_client(
+                    mock_wrapped, None,
+                    ("https://oauth-error-server.com/mcp",),
+                    {}
+                )
+        # Verify the wrapped function was never called (auth failed before reaching it)
+        mock_wrapped.assert_not_called()
 
 
 class TestMCPPatcherModeSelection:
@@ -263,61 +433,44 @@ class TestMCPPatcherModeSelection:
         """Test API mode uses MCPInspector."""
         set_state(
             initialized=True,
-            llm_rules=None,
-            api_mode_llm="on_monitor",
-            api_mode_mcp="on_monitor",
             mcp_integration_mode="api",
+            api_mode={"mcp": {"mode": "monitor"}},
         )
-        
         mock_api_inspector = MagicMock()
         mock_api_inspector.ainspect_request = AsyncMock(return_value=MagicMock(action="allow"))
         mock_api_inspector.ainspect_response = AsyncMock(return_value=MagicMock(action="allow"))
-        
         mock_result = {"content": [{"type": "text", "text": "Result"}]}
         wrapped = AsyncMock(return_value=mock_result)
-        
         with patch.object(mcp_patcher, "_get_api_inspector", return_value=mock_api_inspector):
             result = await mcp_patcher._wrap_call_tool(
-                wrapped, None, 
+                wrapped, None,
                 ["search_docs", {"query": "test"}], {}
             )
-            
             assert mock_api_inspector.ainspect_request.called
             assert mock_api_inspector.ainspect_response.called
             assert wrapped.called
 
     @pytest.mark.asyncio
     async def test_gateway_mode_uses_gateway_inspector(self):
-        """Test gateway mode uses MCPGatewayInspector."""
+        """Test gateway mode uses MCPGatewayInspector (pass-through)."""
         set_state(
             initialized=True,
-            llm_rules=None,
-            api_mode_llm="on_monitor",
-            api_mode_mcp="on_monitor",
             mcp_integration_mode="gateway",
-            gateway_mode_mcp="on",
-            gateway_mode_mcp_url="https://gateway.example.com/mcp",
-            gateway_mode_mcp_api_key="test-key",
+            gateway_mode={"mcp_gateways": {"https://mcp.example.com/mcp": {"gateway_url": "https://gateway.example.com/mcp"}}},
+            api_mode={"mcp": {"mode": "monitor"}},
         )
-        
         mock_gateway_inspector = MagicMock()
-        mock_gateway_inspector.is_configured = True
         mock_gateway_inspector.ainspect_request = AsyncMock(return_value=MagicMock(action="allow"))
         mock_gateway_inspector.ainspect_response = AsyncMock(return_value=MagicMock(action="allow"))
-        
         mock_result = {"content": [{"type": "text", "text": "Gateway result"}]}
         wrapped = AsyncMock(return_value=mock_result)
-        
-        with patch.object(mcp_patcher, "_get_gateway_inspector", return_value=mock_gateway_inspector):
+        with patch.object(mcp_patcher, "_get_gateway_pass_through_inspector", return_value=mock_gateway_inspector):
             result = await mcp_patcher._wrap_call_tool(
                 wrapped, None,
                 ["search_docs", {"query": "test"}], {}
             )
-            
-            # Gateway inspector should be called (pass-through)
             assert mock_gateway_inspector.ainspect_request.called
             assert mock_gateway_inspector.ainspect_response.called
-            # Wrapped should also be called
             assert wrapped.called
             assert result == mock_result
 
@@ -330,10 +483,8 @@ class TestMCPPromptResourceWrappers:
         """Test _wrap_get_prompt uses API inspector in api mode."""
         set_state(
             initialized=True,
-            llm_rules=None,
-            api_mode_llm="on_monitor",
-            api_mode_mcp="on_monitor",
             mcp_integration_mode="api",
+            api_mode={"mcp": {"mode": "monitor"}},
         )
         
         mock_api_inspector = MagicMock()
@@ -364,10 +515,8 @@ class TestMCPPromptResourceWrappers:
         """Test _wrap_get_prompt skips inspection when mode is off."""
         set_state(
             initialized=True,
-            llm_rules=None,
-            api_mode_llm="on_monitor",
-            api_mode_mcp="off",
             mcp_integration_mode="api",
+            api_mode={"mcp": {"mode": "off"}},
         )
         
         mock_api_inspector = MagicMock()
@@ -392,10 +541,8 @@ class TestMCPPromptResourceWrappers:
         """Test _wrap_read_resource uses API inspector in api mode."""
         set_state(
             initialized=True,
-            llm_rules=None,
-            api_mode_llm="on_monitor",
-            api_mode_mcp="on_monitor",
             mcp_integration_mode="api",
+            api_mode={"mcp": {"mode": "monitor"}},
         )
         
         mock_api_inspector = MagicMock()
@@ -426,10 +573,8 @@ class TestMCPPromptResourceWrappers:
         """Test _wrap_read_resource skips inspection when mode is off."""
         set_state(
             initialized=True,
-            llm_rules=None,
-            api_mode_llm="on_monitor",
-            api_mode_mcp="off",
             mcp_integration_mode="api",
+            api_mode={"mcp": {"mode": "off"}},
         )
         
         mock_api_inspector = MagicMock()
@@ -454,24 +599,16 @@ class TestMCPPromptResourceWrappers:
         """Test _wrap_get_prompt in gateway mode."""
         set_state(
             initialized=True,
-            llm_rules=None,
-            api_mode_llm="on_monitor",
-            api_mode_mcp="on_monitor",
             mcp_integration_mode="gateway",
-            gateway_mode_mcp="on",
-            gateway_mode_mcp_url="https://gateway.example.com/mcp",
-            gateway_mode_mcp_api_key="test-key",
+            gateway_mode={"mcp_gateways": {"https://mcp.example.com/mcp": {"gateway_url": "https://gateway.example.com/mcp"}}},
+            api_mode={"mcp": {"mode": "monitor"}},
         )
-        
         mock_gateway_inspector = MagicMock()
-        mock_gateway_inspector.is_configured = True
         mock_gateway_inspector.ainspect_request = AsyncMock(return_value=MagicMock(action="allow"))
         mock_gateway_inspector.ainspect_response = AsyncMock(return_value=MagicMock(action="allow"))
-        
         mock_result = MagicMock()
         wrapped = AsyncMock(return_value=mock_result)
-        
-        with patch.object(mcp_patcher, "_get_gateway_inspector", return_value=mock_gateway_inspector):
+        with patch.object(mcp_patcher, "_get_gateway_pass_through_inspector", return_value=mock_gateway_inspector):
             result = await mcp_patcher._wrap_get_prompt(
                 wrapped, None,
                 ["code_review_prompt", {"language": "python"}], {}
@@ -487,24 +624,16 @@ class TestMCPPromptResourceWrappers:
         """Test _wrap_read_resource in gateway mode."""
         set_state(
             initialized=True,
-            llm_rules=None,
-            api_mode_llm="on_monitor",
-            api_mode_mcp="on_monitor",
             mcp_integration_mode="gateway",
-            gateway_mode_mcp="on",
-            gateway_mode_mcp_url="https://gateway.example.com/mcp",
-            gateway_mode_mcp_api_key="test-key",
+            gateway_mode={"mcp_gateways": {"https://mcp.example.com/mcp": {"gateway_url": "https://gateway.example.com/mcp"}}},
+            api_mode={"mcp": {"mode": "monitor"}},
         )
-        
         mock_gateway_inspector = MagicMock()
-        mock_gateway_inspector.is_configured = True
         mock_gateway_inspector.ainspect_request = AsyncMock(return_value=MagicMock(action="allow"))
         mock_gateway_inspector.ainspect_response = AsyncMock(return_value=MagicMock(action="allow"))
-        
         mock_result = MagicMock()
         wrapped = AsyncMock(return_value=mock_result)
-        
-        with patch.object(mcp_patcher, "_get_gateway_inspector", return_value=mock_gateway_inspector):
+        with patch.object(mcp_patcher, "_get_gateway_pass_through_inspector", return_value=mock_gateway_inspector):
             result = await mcp_patcher._wrap_read_resource(
                 wrapped, None,
                 ["file:///config.yaml"], {}
@@ -514,3 +643,30 @@ class TestMCPPromptResourceWrappers:
             assert mock_gateway_inspector.ainspect_response.called
             assert wrapped.called
             assert result == mock_result
+
+
+class TestMCP405ReconnectPatch:
+    """Test MCP handle_get_stream 405 reconnection patch."""
+
+    def test_patch_mcp_handle_get_stream_405_replaces_method(self):
+        """Test that _patch_mcp_handle_get_stream_405 replaces handle_get_stream when MCP is available."""
+        pytest.importorskip("mcp")
+        from mcp.client import streamable_http as _sh
+
+        orig_handle_get_stream = _sh.StreamableHTTPTransport.handle_get_stream
+
+        # Apply patch
+        mcp_patcher._patch_mcp_handle_get_stream_405()
+
+        # Verify method was replaced
+        assert _sh.StreamableHTTPTransport.handle_get_stream is not orig_handle_get_stream
+        assert callable(_sh.StreamableHTTPTransport.handle_get_stream)
+
+    def test_patch_mcp_handle_get_stream_405_idempotent(self):
+        """Test that _patch_mcp_handle_get_stream_405 can be called multiple times without error."""
+        pytest.importorskip("mcp")
+        # First call replaces the method; second call replaces with same patched version
+        mcp_patcher._patch_mcp_handle_get_stream_405()
+        mcp_patcher._patch_mcp_handle_get_stream_405()
+        from mcp.client import streamable_http as _sh
+        assert callable(_sh.StreamableHTTPTransport.handle_get_stream)

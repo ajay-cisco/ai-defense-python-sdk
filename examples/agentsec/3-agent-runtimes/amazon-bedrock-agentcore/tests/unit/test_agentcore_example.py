@@ -114,8 +114,7 @@ class TestFileStructure:
         with open(env_file, "r") as f:
             content = f.read()
         
-        assert "AI_DEFENSE_API_MODE_LLM_ENDPOINT" in content, "Should document AI_DEFENSE_API_MODE_LLM_ENDPOINT"
-        assert "AGENTSEC_API_MODE_LLM" in content, "Should document AGENTSEC_API_MODE_LLM"
+        assert "AI_DEFENSE_API_MODE_LLM_API_KEY" in content, "Should document AI_DEFENSE_API_MODE_LLM_API_KEY"
     
     def test_dockerfile_exists(self):
         """Test that container-deploy/Dockerfile exists."""
@@ -164,23 +163,15 @@ class TestAgentFactory:
         """Test that dotenv is imported for env loading."""
         assert "from dotenv import load_dotenv" in agent_factory_code, "Should import load_dotenv"
     
-    def test_llm_integration_mode_configurable(self, agent_factory_code):
-        """Test that LLM integration mode is configurable."""
-        assert "llm_integration_mode" in agent_factory_code, "Should configure llm_integration_mode"
+    def test_yaml_config_used(self, agent_factory_code):
+        """Test that agentsec.yaml config file is used."""
+        assert "agentsec.yaml" in agent_factory_code, \
+            "Should reference agentsec.yaml config file"
     
-    def test_api_mode_endpoint_configurable(self, agent_factory_code):
-        """Test that API mode endpoint is configurable."""
-        assert "api_mode_llm_endpoint" in agent_factory_code, "Should configure api_mode_llm_endpoint"
-    
-    def test_providers_configured(self, agent_factory_code):
-        """Test that providers are configured."""
-        assert "providers=" in agent_factory_code or "providers={" in agent_factory_code, \
-            "Should configure providers"
-    
-    def test_bedrock_gateway_configurable(self, agent_factory_code):
-        """Test that Bedrock gateway is configurable."""
-        assert "AGENTSEC_BEDROCK_GATEWAY_URL" in agent_factory_code, \
-            "Should configure AGENTSEC_BEDROCK_GATEWAY_URL"
+    def test_config_param_passed(self, agent_factory_code):
+        """Test that config= parameter is passed to protect()."""
+        assert "config=" in agent_factory_code, \
+            "Should pass config= parameter to agentsec.protect()"
     
     def test_strands_agent_created(self, agent_factory_code):
         """Test that Strands Agent is created."""
@@ -372,12 +363,12 @@ class TestContainerDeploy:
             content = f.read()
         assert "python:3.11" in content, "Dockerfile should use Python 3.11"
     
-    def test_dockerfile_copies_agentsec(self):
-        """Test that Dockerfile copies agentsec source."""
+    def test_dockerfile_copies_aidefense(self):
+        """Test that Dockerfile copies aidefense SDK source."""
         dockerfile = os.path.join(os.path.dirname(__file__), "..", "..", "container-deploy", "Dockerfile")
         with open(dockerfile, "r") as f:
             content = f.read()
-        assert "COPY agentsec" in content, "Dockerfile should copy agentsec source"
+        assert "COPY aidefense" in content, "Dockerfile should copy aidefense SDK source"
 
 
 # =============================================================================

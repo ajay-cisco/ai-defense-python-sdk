@@ -142,7 +142,7 @@ Configure via environment variables:
 AGENTSEC_LLM_INTEGRATION_MODE=api
 AI_DEFENSE_API_MODE_LLM_ENDPOINT=https://api.inspect.aidefense.cisco.com/api
 AI_DEFENSE_API_MODE_LLM_API_KEY=your-api-key
-AGENTSEC_API_MODE_LLM=on_enforce  # or on_monitor, off
+AGENTSEC_API_MODE_LLM=enforce  # or monitor, off
 ```
 
 See [Runtime Protection](#runtime-protection) for detailed configuration options.
@@ -253,7 +253,6 @@ print(resp.task_id)
 - `mcpscan/mcp_scan.py` — MCPScanClient for scanning MCP servers
 - `mcpscan/resource_connections.py` — ResourceConnectionClient for managing resource connections
 - `mcpscan/policies.py` — MCPPolicyClient for managing MCP Gateway policies
-- `mcpscan/events.py` — MCPEventClient for retrieving MCP-related events
 - `mcpscan/models.py` — Data models for MCP server scanning, connections, and events
 
 ### Model Scanning API
@@ -295,7 +294,7 @@ from aidefense.runtime import agentsec
 
 agentsec.protect(
     llm_integration_mode="api",
-    api_mode_llm="on_enforce",  # on_monitor, on_enforce, or off
+    api_mode_llm="enforce",  # monitor, enforce, or off
     api_mode_llm_endpoint="https://api.inspect.aidefense.cisco.com/api",
     api_mode_llm_api_key="your-api-key",
     api_mode_fail_open_llm=True,  # Allow requests if API is unavailable

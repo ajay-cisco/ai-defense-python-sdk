@@ -72,8 +72,8 @@ class TestFileStructure:
         with open(env_file, "r") as f:
             content = f.read()
         
-        assert "AGENTSEC_API_MODE_LLM" in content, "Should document AGENTSEC_API_MODE_LLM"
-        assert "MCP_SERVER_URL" in content, "Should document MCP_SERVER_URL"
+        assert "AI_DEFENSE_API_MODE_LLM_API_KEY" in content, "Should document AI_DEFENSE_API_MODE_LLM_API_KEY"
+        assert "AI_DEFENSE_API_MODE_MCP_API_KEY" in content
     
     def test_runner_script_exists(self):
         """Test that scripts/run.sh exists."""
@@ -97,7 +97,7 @@ class TestImportOrder:
         for i, line in enumerate(lines):
             if "load_dotenv" in line and "import" not in line:
                 dotenv_line = i
-            if "import agentsec" in line:
+            if "from aidefense.runtime import agentsec" in line:
                 agentsec_line = i
         
         assert dotenv_line is not None, "Should call load_dotenv()"
@@ -111,7 +111,7 @@ class TestImportOrder:
         crewai_line = None
         
         for i, line in enumerate(lines):
-            if "import agentsec" in line:
+            if "from aidefense.runtime import agentsec" in line:
                 agentsec_line = i
             if "from crewai import" in line:
                 crewai_line = i
@@ -137,8 +137,8 @@ class TestImportOrder:
         assert protect_line < crewai_line, "agentsec.protect() should be called before CrewAI import"
     
     def test_agentsec_protect_called(self, example_code):
-        """Test that agentsec.protect() is called."""
-        assert "agentsec.protect()" in example_code, "Should call agentsec.protect()"
+        """Test that agentsec.protect() is called with config."""
+        assert "agentsec.protect(" in example_code and "config=config_path" in example_code, "Should call agentsec.protect() with config"
 
 
 # =============================================================================
@@ -152,13 +152,13 @@ class TestAgentsecIntegration:
         """Test that agentsec.protect() is called."""
         assert "agentsec.protect" in example_code, "Should call agentsec.protect()"
     
-    def test_agentsec_protect_minimal(self, example_code):
-        """Test that agentsec.protect() is used with minimal setup."""
-        assert "agentsec.protect()" in example_code, "Should call agentsec.protect()"
+    def test_agentsec_protect_with_config(self, example_code):
+        """Test that agentsec.protect() is used with YAML config."""
+        assert "agentsec.protect(" in example_code and "config=config_path" in example_code, "Should call agentsec.protect() with config"
     
-    def test_mode_from_environment(self, example_code):
-        """Test that mode is read from environment variable."""
-        assert 'AGENTSEC_API_MODE_LLM' in example_code, "Should read AGENTSEC_API_MODE_LLM from env"
+    def test_config_yaml_referenced(self, example_code):
+        """Test that agentsec.yaml config file is referenced."""
+        assert 'agentsec.yaml' in example_code, "Should reference agentsec.yaml config file"
     
     def test_security_policy_error_handled(self, example_code):
         """Test that SecurityPolicyError is imported and handled."""
@@ -235,9 +235,9 @@ class TestMCPIntegration:
 class TestDebugLogging:
     """Tests for debug logging implementation."""
     
-    def test_debug_prefix_used(self, example_code):
-        """Test that [DEBUG] prefix is used for debug messages."""
-        assert '[DEBUG]' in example_code, "Should use [DEBUG] prefix"
+    def test_debug_logging_used(self, example_code):
+        """Test that logger.debug is used for debug messages."""
+        assert 'logger.debug' in example_code, "Should use logger.debug for debug messages"
     
     def test_flush_used(self, example_code):
         """Test that flush=True is used for immediate output."""
@@ -245,12 +245,12 @@ class TestDebugLogging:
     
     def test_debug_messages_exist(self, example_code):
         """Test that debug messages are present in the code."""
-        assert '[DEBUG]' in example_code, "Should have [DEBUG] messages for debugging"
+        assert 'logger.debug' in example_code, "Should have logger.debug messages for debugging"
     
-    def test_debug_on_tool_calls(self, example_code):
-        """Test that debug messages are printed for tool calls."""
-        assert "[TOOL CALL]" in example_code or "[DEBUG] fetch_url" in example_code, \
-            "Should log tool calls"
+    def test_logging_configured(self, example_code):
+        """Test that logging is properly configured."""
+        assert "logging.basicConfig" in example_code or "logging.getLogger" in example_code, \
+            "Should configure logging"
 
 
 # =============================================================================

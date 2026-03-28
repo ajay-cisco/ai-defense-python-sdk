@@ -240,7 +240,7 @@ class TestPatcherSkipIntegration:
         
         # When not skipped and mode is enforce, should inspect
         with patch('aidefense.runtime.agentsec.patchers.openai._state') as mock_state:
-            mock_state.get_llm_mode.return_value = "on_enforce"
+            mock_state.get_llm_mode.return_value = "enforce"
             with patch('aidefense.runtime.agentsec.patchers.openai.get_inspection_context') as mock_ctx:
                 mock_ctx.return_value = MagicMock(done=False)
                 assert _should_inspect() is True
@@ -248,16 +248,6 @@ class TestPatcherSkipIntegration:
         # When skipped, should not inspect
         with skip_inspection(llm=True):
             assert _should_inspect() is False
-    
-    def test_openai_should_use_gateway_respects_skip(self):
-        """Test OpenAI patcher's _should_use_gateway respects skip state."""
-        from aidefense.runtime.agentsec.patchers.openai import _should_use_gateway
-        
-        _skip_llm.set(False)
-        
-        # When skipped, should not use gateway
-        with skip_inspection(llm=True):
-            assert _should_use_gateway() is False
     
     def test_mcp_should_inspect_respects_skip(self):
         """Test MCP patcher's _should_inspect respects skip state."""
@@ -267,7 +257,7 @@ class TestPatcherSkipIntegration:
         
         # When not skipped and mode is enforce, should inspect
         with patch('aidefense.runtime.agentsec.patchers.mcp._state') as mock_state:
-            mock_state.get_mcp_mode.return_value = "on_enforce"
+            mock_state.get_mcp_mode.return_value = "enforce"
             mock_state.get_config.return_value = MagicMock(mcp_enabled=True)
             assert _should_inspect() is True
         
@@ -276,7 +266,7 @@ class TestPatcherSkipIntegration:
             assert _should_inspect() is False
     
     def test_mcp_should_use_gateway_respects_skip(self):
-        """Test MCP patcher's _should_use_gateway respects skip state."""
+        """Test MCP patcher respects skip state for gateway (via _should_use_gateway)."""
         from aidefense.runtime.agentsec.patchers.mcp import _should_use_gateway
         
         _skip_mcp.set(False)
@@ -311,7 +301,7 @@ class TestEndToEndSkipScenarios:
             # MCP should NOT be skipped (check mode)
             from aidefense.runtime.agentsec.patchers.mcp import _should_inspect as mcp_should_inspect
             with patch('aidefense.runtime.agentsec.patchers.mcp._state') as mock_state:
-                mock_state.get_mcp_mode.return_value = "on_enforce"
+                mock_state.get_mcp_mode.return_value = "enforce"
                 mock_state.get_config.return_value = MagicMock(mcp_enabled=True)
                 assert mcp_should_inspect() is True
     
@@ -328,7 +318,7 @@ class TestEndToEndSkipScenarios:
             # LLM should NOT be skipped (check mode)
             from aidefense.runtime.agentsec.patchers.openai import _should_inspect as openai_should_inspect
             with patch('aidefense.runtime.agentsec.patchers.openai._state') as mock_state:
-                mock_state.get_llm_mode.return_value = "on_enforce"
+                mock_state.get_llm_mode.return_value = "enforce"
                 with patch('aidefense.runtime.agentsec.patchers.openai.get_inspection_context') as mock_ctx:
                     mock_ctx.return_value = MagicMock(done=False)
                     assert openai_should_inspect() is True

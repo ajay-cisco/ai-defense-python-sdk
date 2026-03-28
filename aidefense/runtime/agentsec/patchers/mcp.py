@@ -19,9 +19,11 @@ import logging
 import threading
 from typing import Any, Dict, Optional, Union
 
+import httpx
 import wrapt
 
 from .. import _state
+from ..gateway_settings import GatewaySettings
 from .._context import get_inspection_context, set_inspection_context
 from ..decision import Decision
 from ..exceptions import SecurityPolicyError
@@ -34,7 +36,7 @@ logger = logging.getLogger("aidefense.runtime.agentsec.patchers.mcp")
 
 # Global inspector instances with thread-safe initialization
 _api_inspector: Optional[MCPInspector] = None
-_gateway_inspector: Optional[MCPGatewayInspector] = None
+_gateway_pass_through_inspector: Optional[MCPGatewayInspector] = None
 _inspector_lock = threading.Lock()
 
 # Track gateway mode state for URL redirection (log only once)
@@ -50,7 +52,7 @@ def _get_api_inspector() -> MCPInspector:
                 if not _state.is_initialized():
                     logger.warning("agentsec.protect() not called, using default config")
                 _api_inspector = MCPInspector(
-                    fail_open=_state.get_api_mode_fail_open_mcp(),
+                    fail_open=_state.get_api_mcp_fail_open(),
                 )
                 # Register for cleanup on shutdown
                 from ..inspectors import register_inspector_for_cleanup
@@ -58,51 +60,49 @@ def _get_api_inspector() -> MCPInspector:
     return _api_inspector
 
 
-def _get_gateway_inspector() -> MCPGatewayInspector:
-    """Get or create the MCPGatewayInspector instance for gateway mode (thread-safe)."""
-    global _gateway_inspector
-    if _gateway_inspector is None:
+def _get_gateway_settings_for_url(original_url: str) -> Optional[GatewaySettings]:
+    """Resolve MCP gateway settings for a given MCP server URL.
+
+    Looks up the gateway configuration keyed by the exact MCP server URL.
+    Returns None if no gateway is configured for this URL.
+    """
+    config = _state.get_mcp_gateway_for_url(original_url)
+    if config is None:
+        return None
+    return _state.resolve_mcp_gateway_settings(config)
+
+
+def _get_gateway_pass_through_inspector() -> MCPGatewayInspector:
+    """Get pass-through inspector for gateway mode (used when URL redirect happens at transport level)."""
+    global _gateway_pass_through_inspector
+    if _gateway_pass_through_inspector is None:
         with _inspector_lock:
-            if _gateway_inspector is None:
-                gateway_url = _state.get_mcp_gateway_url()
-                gateway_api_key = _state.get_mcp_gateway_api_key()
-                
-                _gateway_inspector = MCPGatewayInspector(
-                    gateway_url=gateway_url,
-                    api_key=gateway_api_key,
-                    fail_open=_state.get_gateway_mode_fail_open_mcp(),
+            if _gateway_pass_through_inspector is None:
+                _gateway_pass_through_inspector = MCPGatewayInspector(
+                    gateway_url=None,
+                    api_key=None,
+                    fail_open=_state.get_gw_mcp_fail_open(),
                 )
-    return _gateway_inspector
+    return _gateway_pass_through_inspector
 
 
 def _get_inspector() -> Union[MCPInspector, MCPGatewayInspector]:
     """Get the appropriate inspector based on integration mode."""
     if _should_use_gateway():
-        return _get_gateway_inspector()
+        return _get_gateway_pass_through_inspector()
     return _get_api_inspector()
 
 
-def _is_gateway_mode() -> bool:
-    """Check if MCP integration mode is 'gateway'."""
-    return _state.get_mcp_integration_mode() == "gateway"
-
-
-def _get_gateway_mode_setting() -> str:
-    """Get the gateway mode setting (off/on)."""
-    return _state.get_mcp_gateway_mode()
-
-
 def _should_use_gateway() -> bool:
-    """Check if we should use gateway mode for MCP (not skipped)."""
+    """Check if we should use gateway mode for MCP (not skipped, not off)."""
     from .._context import is_mcp_skip_active
+    if _state.get_mcp_integration_mode() != "gateway":
+        return False
+    if _state.get_gw_mcp_mode() == "off":
+        return False
     if is_mcp_skip_active():
         return False
-    if not _is_gateway_mode():
-        return False
-    if _get_gateway_mode_setting() == "off":
-        return False
-    gateway_inspector = _get_gateway_inspector()
-    return gateway_inspector.is_configured
+    return True
 
 
 def _should_inspect() -> bool:
@@ -119,49 +119,168 @@ def _should_inspect() -> bool:
 def _enforce_decision(decision: Decision) -> None:
     """Enforce a decision if in enforce mode."""
     mode = _state.get_mcp_mode()
-    if mode == "on_enforce" and decision.action == "block":
+    if mode == "enforce" and decision.action == "block":
         raise SecurityPolicyError(decision)
+
+
+def _patch_mcp_handle_get_stream_405() -> None:
+    """Patch MCP StreamableHTTPTransport.handle_get_stream to skip retries on 405.
+
+    Some MCP servers (e.g. remote.mcpservers.org, AI Defense gateway) return 405
+    Method Not Allowed when the client tries to reconnect the GET SSE stream after
+    a disconnect. Retrying is futile and produces noisy logs. Tool calls still
+    succeed via the POST path. This patch detects 405 and exits early.
+    """
+    try:
+        from mcp.client import streamable_http as _sh
+    except ImportError:
+        return
+
+    _LAST_EVENT_ID = getattr(_sh, "LAST_EVENT_ID", "last-event-id")
+    _DEFAULT_RECONNECTION_DELAY_MS = getattr(_sh, "DEFAULT_RECONNECTION_DELAY_MS", 1000)
+    _MAX_RECONNECTION_ATTEMPTS = getattr(_sh, "MAX_RECONNECTION_ATTEMPTS", 2)
+    _mcp_logger = getattr(_sh, "logger", logger)
+
+    async def _patched_handle_get_stream(self, client, read_stream_writer):
+        import anyio
+        from httpx_sse import aconnect_sse
+
+        last_event_id = None
+        retry_interval_ms = None
+        attempt = 0
+
+        while attempt < _MAX_RECONNECTION_ATTEMPTS:
+            try:
+                if not self.session_id:
+                    return
+                headers = self._prepare_headers()
+                if last_event_id:
+                    headers[_LAST_EVENT_ID] = last_event_id
+
+                async with aconnect_sse(client, "GET", self.url, headers=headers) as event_source:
+                    event_source.response.raise_for_status()
+                    _mcp_logger.debug("GET SSE connection established")
+
+                    async for sse in event_source.aiter_sse():
+                        if sse.id:
+                            last_event_id = sse.id
+                        if sse.retry is not None:
+                            retry_interval_ms = sse.retry
+                        await self._handle_sse_event(sse, read_stream_writer)
+
+                attempt = 0
+            except Exception as exc:
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 405:
+                    logger.debug(
+                        "MCP GET stream reconnection returned 405 (Method Not Allowed); "
+                        "server does not support stream reconnect, skipping retries"
+                    )
+                    return
+                _mcp_logger.debug("GET stream error", exc_info=True)
+                attempt += 1
+
+            if attempt >= _MAX_RECONNECTION_ATTEMPTS:
+                _mcp_logger.debug(
+                    f"GET stream max reconnection attempts ({_MAX_RECONNECTION_ATTEMPTS}) exceeded"
+                )
+                return
+
+            delay_ms = retry_interval_ms if retry_interval_ms is not None else _DEFAULT_RECONNECTION_DELAY_MS
+            _mcp_logger.info(f"GET stream disconnected, reconnecting in {delay_ms}ms...")
+            await anyio.sleep(delay_ms / 1000.0)
+
+    _sh.StreamableHTTPTransport.handle_get_stream = _patched_handle_get_stream
 
 
 def _wrap_streamablehttp_client(wrapped, instance, args, kwargs):
     """
     Wrapper for streamablehttp_client to redirect URL to gateway in gateway mode.
-    
-    In gateway mode, this intercepts the MCP transport creation and redirects
-    the connection to the AI Defense Gateway URL. The gateway then handles
-    inspection and proxies to the actual MCP server.
+
+    Uses URL-based resolution: looks up gateway for the original MCP server URL,
+    then swaps URL and injects auth headers.
     """
     global _gateway_mode_logged
-    
-    if _should_use_gateway():
-        gateway_inspector = _get_gateway_inspector()
-        redirect_url = gateway_inspector.get_redirect_url()
-        
-        if redirect_url:
-            # Get the original URL for logging
-            original_url = kwargs.get('url') or (args[0] if args else None)
-            
-            if not _gateway_mode_logged:
-                logger.info(f"[MCP GATEWAY] Redirecting MCP connections to gateway")
-                logger.debug(f"[MCP GATEWAY] Original URL: {original_url}")
-                logger.debug(f"[MCP GATEWAY] Gateway URL: {redirect_url}")
-                _gateway_mode_logged = True
-            
-            # Replace URL with gateway URL
-            if 'url' in kwargs:
-                kwargs['url'] = redirect_url
-            elif args:
-                args = (redirect_url,) + args[1:]
-            
-            # Add gateway headers
-            gateway_headers = gateway_inspector.get_headers()
-            if gateway_headers:
-                headers = kwargs.get('headers', {})
-                if headers is None:
-                    headers = {}
-                headers.update(gateway_headers)
-                kwargs['headers'] = headers
-    
+
+    if not _should_use_gateway():
+        return wrapped(*args, **kwargs)
+
+    # Extract the original MCP server URL
+    original_url = kwargs.get('url') or (args[0] if args else None)
+    if not original_url:
+        return wrapped(*args, **kwargs)
+
+    # Resolve gateway config for this URL
+    gw_settings = _get_gateway_settings_for_url(original_url)
+    if gw_settings is None:
+        # Gateway mode is active but no gateway configured for this MCP URL.
+        # Raise rather than silently connecting directly (no inspection).
+        raise SecurityPolicyError(
+            Decision.block(
+                reasons=[
+                    f"MCP gateway mode enabled but no gateway configured "
+                    f"for URL '{original_url}'"
+                ]
+            ),
+            f"MCP gateway mode is active but no gateway configuration "
+            f"found for URL '{original_url}'. Configure a gateway for "
+            f"this URL in gateway_mode.mcp_gateways or switch to api "
+            f"integration mode.",
+        )
+
+    if not gw_settings.url:
+        # Gateway entry exists but has no URL — treat as misconfiguration.
+        raise SecurityPolicyError(
+            Decision.block(
+                reasons=[
+                    f"MCP gateway configured for URL '{original_url}' "
+                    f"but gateway URL is empty"
+                ]
+            ),
+            f"MCP gateway entry found for '{original_url}' but gateway "
+            f"URL is not set. Check gateway_mode.mcp_gateways configuration.",
+        )
+
+    if not _gateway_mode_logged:
+        logger.info("[MCP GATEWAY] Redirecting MCP connections to gateway")
+        logger.debug(f"[MCP GATEWAY] Original URL: {original_url}")
+        logger.debug(f"[MCP GATEWAY] Gateway URL: {gw_settings.url}")
+        _gateway_mode_logged = True
+
+    # Copy kwargs to avoid mutating the caller's dict
+    kwargs = dict(kwargs)
+    # Replace URL with gateway URL
+    if 'url' in kwargs:
+        kwargs['url'] = gw_settings.url
+    elif args:
+        args = (gw_settings.url,) + args[1:]
+
+    # Inject auth headers based on auth_mode
+    if gw_settings.auth_mode == "api_key" and gw_settings.api_key:
+        headers = kwargs.get('headers', {})
+        if headers is None:
+            headers = {}
+        headers = dict(headers)
+        headers['api-key'] = gw_settings.api_key
+        kwargs['headers'] = headers
+
+    elif gw_settings.auth_mode == "oauth2_client_credentials":
+        from .._oauth2 import get_oauth2_token
+
+        token = get_oauth2_token(
+            token_url=gw_settings.oauth2_token_url,
+            client_id=gw_settings.oauth2_client_id,
+            client_secret=gw_settings.oauth2_client_secret,
+            scopes=gw_settings.oauth2_scopes,
+        )
+        headers = kwargs.get('headers', {})
+        if headers is None:
+            headers = {}
+        headers = dict(headers)
+        headers['Authorization'] = f'Bearer {token}'
+        kwargs['headers'] = headers
+
+    # auth_mode == "none" — no headers injected
+
     return wrapped(*args, **kwargs)
 
 
@@ -172,6 +291,8 @@ async def _wrap_call_tool(wrapped, instance, args, kwargs):
     - API mode: MCPInspector (makes API calls for inspection)
     - Gateway mode: MCPGatewayInspector (pass-through, gateway handles inspection)
     """
+    # Reset inspection context for this new call
+    set_inspection_context(done=False)
     # Extract tool info
     tool_name = args[0] if args else kwargs.get("name", "")
     arguments = args[1] if len(args) > 1 else kwargs.get("arguments", {})
@@ -181,7 +302,6 @@ async def _wrap_call_tool(wrapped, instance, args, kwargs):
     
     # Log the call
     if use_gateway:
-        logger.debug(f"")
         logger.debug(f"╔══════════════════════════════════════════════════════════════")
         logger.debug(f"║ [PATCHED] MCP TOOL CALL: {tool_name}")
         logger.debug(f"║ Arguments: {arguments}")
@@ -189,7 +309,6 @@ async def _wrap_call_tool(wrapped, instance, args, kwargs):
         logger.debug(f"╚══════════════════════════════════════════════════════════════")
     else:
         mode = _state.get_mcp_mode()
-        logger.debug(f"")
         logger.debug(f"╔══════════════════════════════════════════════════════════════")
         logger.debug(f"║ [PATCHED] MCP TOOL CALL: {tool_name}")
         logger.debug(f"║ Arguments: {arguments}")
@@ -216,7 +335,7 @@ async def _wrap_call_tool(wrapped, instance, args, kwargs):
     except Exception as e:
         logger.warning(f"[PATCHED CALL] MCP.call_tool({tool_name}) - Request inspection error: {e}")
         # Use inspector's fail_open setting for consistency
-        fail_open = getattr(inspector, 'fail_open', _state.get_api_mode_fail_open_mcp())
+        fail_open = getattr(inspector, 'fail_open', _state.get_api_mcp_fail_open())
         if not fail_open:
             decision = Decision.block(reasons=[f"MCP inspection error: {e}"])
             raise SecurityPolicyError(decision, f"MCP inspection failed: {e}")
@@ -237,6 +356,8 @@ async def _wrap_call_tool(wrapped, instance, args, kwargs):
         raise
     except Exception as e:
         logger.warning(f"[PATCHED CALL] MCP.call_tool({tool_name}) - Response inspection error: {e}")
+        # Mark inspection as done (fail-open) so context is not left incomplete
+        set_inspection_context(decision=Decision.allow(reasons=[f"MCP response inspection error: {e}"]), done=True)
     
     logger.debug(f"[PATCHED CALL] MCP.call_tool({tool_name}) - complete")
     return result
@@ -249,6 +370,8 @@ async def _wrap_get_prompt(wrapped, instance, args, kwargs):
     - API mode: MCPInspector (makes API calls for inspection)
     - Gateway mode: MCPGatewayInspector (pass-through, gateway handles inspection)
     """
+    # Reset inspection context for this new call
+    set_inspection_context(done=False)
     # Extract prompt info
     prompt_name = args[0] if args else kwargs.get("name", "")
     arguments = args[1] if len(args) > 1 else kwargs.get("arguments", {})
@@ -258,7 +381,6 @@ async def _wrap_get_prompt(wrapped, instance, args, kwargs):
     
     # Log the call
     if use_gateway:
-        logger.debug(f"")
         logger.debug(f"╔══════════════════════════════════════════════════════════════")
         logger.debug(f"║ [PATCHED] MCP GET PROMPT: {prompt_name}")
         logger.debug(f"║ Arguments: {arguments}")
@@ -266,7 +388,6 @@ async def _wrap_get_prompt(wrapped, instance, args, kwargs):
         logger.debug(f"╚══════════════════════════════════════════════════════════════")
     else:
         mode = _state.get_mcp_mode()
-        logger.debug(f"")
         logger.debug(f"╔══════════════════════════════════════════════════════════════")
         logger.debug(f"║ [PATCHED] MCP GET PROMPT: {prompt_name}")
         logger.debug(f"║ Arguments: {arguments}")
@@ -293,7 +414,7 @@ async def _wrap_get_prompt(wrapped, instance, args, kwargs):
     except Exception as e:
         logger.warning(f"[PATCHED CALL] MCP.get_prompt({prompt_name}) - Request inspection error: {e}")
         # Use inspector's fail_open setting for consistency
-        fail_open = getattr(inspector, 'fail_open', _state.get_api_mode_fail_open_mcp())
+        fail_open = getattr(inspector, 'fail_open', _state.get_api_mcp_fail_open())
         if not fail_open:
             decision = Decision.block(reasons=[f"MCP inspection error: {e}"])
             raise SecurityPolicyError(decision, f"MCP inspection failed: {e}")
@@ -314,6 +435,8 @@ async def _wrap_get_prompt(wrapped, instance, args, kwargs):
         raise
     except Exception as e:
         logger.warning(f"[PATCHED CALL] MCP.get_prompt({prompt_name}) - Response inspection error: {e}")
+        # Mark inspection as done (fail-open) so context is not left incomplete
+        set_inspection_context(decision=Decision.allow(reasons=[f"MCP response inspection error: {e}"]), done=True)
     
     logger.debug(f"[PATCHED CALL] MCP.get_prompt({prompt_name}) - complete")
     return result
@@ -326,6 +449,8 @@ async def _wrap_read_resource(wrapped, instance, args, kwargs):
     - API mode: MCPInspector (makes API calls for inspection)
     - Gateway mode: MCPGatewayInspector (pass-through, gateway handles inspection)
     """
+    # Reset inspection context for this new call
+    set_inspection_context(done=False)
     # Extract resource info - read_resource takes a URI
     resource_uri = args[0] if args else kwargs.get("uri", "")
     
@@ -334,14 +459,12 @@ async def _wrap_read_resource(wrapped, instance, args, kwargs):
     
     # Log the call
     if use_gateway:
-        logger.debug(f"")
         logger.debug(f"╔══════════════════════════════════════════════════════════════")
         logger.debug(f"║ [PATCHED] MCP READ RESOURCE: {resource_uri}")
         logger.debug(f"║ Integration: gateway (gateway handles inspection)")
         logger.debug(f"╚══════════════════════════════════════════════════════════════")
     else:
         mode = _state.get_mcp_mode()
-        logger.debug(f"")
         logger.debug(f"╔══════════════════════════════════════════════════════════════")
         logger.debug(f"║ [PATCHED] MCP READ RESOURCE: {resource_uri}")
         logger.debug(f"║ MCP Mode: {mode} | Integration: {integration_mode}")
@@ -367,7 +490,7 @@ async def _wrap_read_resource(wrapped, instance, args, kwargs):
     except Exception as e:
         logger.warning(f"[PATCHED CALL] MCP.read_resource({resource_uri}) - Request inspection error: {e}")
         # Use inspector's fail_open setting for consistency
-        fail_open = getattr(inspector, 'fail_open', _state.get_api_mode_fail_open_mcp())
+        fail_open = getattr(inspector, 'fail_open', _state.get_api_mcp_fail_open())
         if not fail_open:
             decision = Decision.block(reasons=[f"MCP inspection error: {e}"])
             raise SecurityPolicyError(decision, f"MCP inspection failed: {e}")
@@ -388,6 +511,8 @@ async def _wrap_read_resource(wrapped, instance, args, kwargs):
         raise
     except Exception as e:
         logger.warning(f"[PATCHED CALL] MCP.read_resource({resource_uri}) - Response inspection error: {e}")
+        # Mark inspection as done (fail-open) so context is not left incomplete
+        set_inspection_context(decision=Decision.allow(reasons=[f"MCP response inspection error: {e}"]), done=True)
     
     logger.debug(f"[PATCHED CALL] MCP.read_resource({resource_uri}) - complete")
     return result
@@ -459,7 +584,14 @@ def patch_mcp() -> bool:
         except Exception as e:
             # This is less critical - only needed for gateway mode URL redirection
             logger.debug(f"Could not patch streamablehttp_client (gateway mode): {e}")
-        
+
+        # Patch handle_get_stream to suppress 405 retries (server doesn't support GET reconnection)
+        try:
+            _patch_mcp_handle_get_stream_405()
+            logger.debug("MCP handle_get_stream patched for 405 reconnection handling")
+        except Exception as e:
+            logger.debug(f"Could not patch MCP handle_get_stream (405 mitigation): {e}")
+
         mark_patched("mcp")
         # Build list of patched methods for logging
         patched_methods = ["call_tool"]

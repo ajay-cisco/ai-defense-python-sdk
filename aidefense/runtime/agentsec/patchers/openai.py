@@ -19,19 +19,19 @@ patch covers AzureOpenAI without requiring separate handling.
 """
 
 import logging
+import re
 import threading
 from typing import Any, Dict, Iterator, List, Optional
 
 import wrapt
 
 from .. import _state
-from .._context import clear_inspection_context, get_inspection_context, set_inspection_context
+from .._context import get_inspection_context, set_inspection_context
 from ..decision import Decision
 from ..exceptions import SecurityPolicyError
 from ..inspectors.api_llm import LLMInspector
-from ..inspectors.gateway_llm import GatewayClient
 from . import is_patched, mark_patched
-from ._base import safe_import
+from ._base import safe_import, resolve_gateway_settings
 
 logger = logging.getLogger("aidefense.runtime.agentsec.patchers.openai")
 
@@ -39,9 +39,9 @@ logger = logging.getLogger("aidefense.runtime.agentsec.patchers.openai")
 _inspector: Optional[LLMInspector] = None
 _inspector_lock = threading.Lock()
 
-# Global gateway client instance
-_gateway_client: Optional[GatewayClient] = None
-_gateway_lock = threading.Lock()
+# Maximum buffer size for streaming inspection (1MB)
+# Prevents memory issues with very long streaming responses
+MAX_STREAMING_BUFFER_SIZE = 1_000_000
 
 
 def _get_inspector() -> LLMInspector:
@@ -54,18 +54,13 @@ def _get_inspector() -> LLMInspector:
                 if not _state.is_initialized():
                     logger.warning("agentsec.protect() not called, using default config")
                 _inspector = LLMInspector(
-                    fail_open=_state.get_api_mode_fail_open_llm(),
+                    fail_open=_state.get_api_llm_fail_open(),
                     default_rules=_state.get_llm_rules(),
                 )
                 # Register for cleanup on shutdown
                 from ..inspectors import register_inspector_for_cleanup
                 register_inspector_for_cleanup(_inspector)
     return _inspector
-
-
-def _is_gateway_mode() -> bool:
-    """Check if LLM integration mode is 'gateway'."""
-    return _state.get_llm_integration_mode() == "gateway"
 
 
 def _detect_provider(instance) -> str:
@@ -88,8 +83,8 @@ def _detect_provider(instance) -> str:
             base_url = str(getattr(client, 'base_url', ''))
             if 'azure' in base_url.lower():
                 return "azure_openai"
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Error detecting OpenAI provider, defaulting to 'openai': {e}")
     return "openai"
 
 
@@ -127,8 +122,8 @@ def _get_azure_api_version(instance) -> Optional[str]:
                     api_version = query_params.get('api-version')
                     if api_version:
                         return str(api_version)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Error extracting Azure API version: {e}")
     return None
 
 
@@ -148,8 +143,6 @@ def _get_azure_deployment_name(instance, kwargs: Dict[str, Any]) -> Optional[str
     Returns:
         Deployment name string or None if not available
     """
-    import re
-    
     # First try kwargs["model"] - this is the standard way
     model = kwargs.get("model")
     if model:
@@ -173,28 +166,10 @@ def _get_azure_deployment_name(instance, kwargs: Dict[str, Any]) -> Optional[str
             match = re.search(r'/deployments/([^/]+)', base_url)
             if match:
                 return match.group(1)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Error extracting Azure deployment name: {e}")
     
     return None
-
-
-def _should_use_gateway(provider: str = "openai") -> bool:
-    """
-    Check if we should use gateway mode (gateway mode enabled, configured, and not skipped).
-    
-    Args:
-        provider: Provider name - "openai" or "azure_openai"
-    """
-    from .._context import is_llm_skip_active
-    if is_llm_skip_active():
-        return False
-    if not _is_gateway_mode():
-        return False
-    # Check if gateway is properly configured for this provider
-    gateway_url = _state.get_provider_gateway_url(provider)
-    gateway_api_key = _state.get_provider_gateway_api_key(provider)
-    return bool(gateway_url and gateway_api_key)
 
 
 def _normalize_messages(messages: Any) -> List[Dict[str, Any]]:
@@ -274,9 +249,12 @@ def _should_inspect() -> bool:
     from .._context import is_llm_skip_active
     if is_llm_skip_active():
         return False
-    mode = _state.get_llm_mode()
-    if mode == "off":
-        return False
+    if _state.get_llm_integration_mode() == "gateway":
+        if _state.get_gw_llm_mode() == "off":
+            return False
+    else:
+        if _state.get_llm_mode() == "off":
+            return False
     ctx = get_inspection_context()
     return not ctx.done
 
@@ -284,7 +262,7 @@ def _should_inspect() -> bool:
 def _enforce_decision(decision: Decision) -> None:
     """Enforce a decision if in enforce mode."""
     mode = _state.get_llm_mode()
-    if mode == "on_enforce" and decision.action == "block":
+    if mode == "enforce" and decision.action == "block":
         raise SecurityPolicyError(decision)
 
 
@@ -322,14 +300,17 @@ class StreamingInspectionWrapper:
             if hasattr(chunk, "choices") and chunk.choices:
                 delta = chunk.choices[0].delta
                 if hasattr(delta, "content") and delta.content:
-                    self._buffer += delta.content
+                    # Limit buffer size during accumulation to prevent memory issues
+                    if len(self._buffer) < MAX_STREAMING_BUFFER_SIZE:
+                        remaining_capacity = MAX_STREAMING_BUFFER_SIZE - len(self._buffer)
+                        self._buffer += delta.content[:remaining_capacity]
                     self._chunk_count += 1
                     
                     # Incremental inspection
                     if self._chunk_count % self._inspect_interval == 0:
                         self._inspect_buffer()
         except Exception as e:
-            logger.debug(f"Error processing streaming chunk: {e}")
+            logger.warning(f"Error processing streaming chunk: {e}")
         
         return chunk
     
@@ -347,8 +328,17 @@ class StreamingInspectionWrapper:
         if not self._buffer or not _should_inspect():
             return
         
+        # Truncate buffer if it exceeds maximum size to prevent memory issues
+        buffer_to_inspect = self._buffer
+        if len(buffer_to_inspect) > MAX_STREAMING_BUFFER_SIZE:
+            logger.warning(
+                f"Streaming buffer exceeded {MAX_STREAMING_BUFFER_SIZE} bytes "
+                f"({len(buffer_to_inspect)} bytes), truncating for inspection"
+            )
+            buffer_to_inspect = buffer_to_inspect[:MAX_STREAMING_BUFFER_SIZE]
+        
         messages_with_response = self._messages + [
-            {"role": "assistant", "content": self._buffer}
+            {"role": "assistant", "content": buffer_to_inspect}
         ]
         
         try:
@@ -397,13 +387,16 @@ class AsyncStreamingInspectionWrapper:
             if hasattr(chunk, "choices") and chunk.choices:
                 delta = chunk.choices[0].delta
                 if hasattr(delta, "content") and delta.content:
-                    self._buffer += delta.content
+                    # Limit buffer size during accumulation to prevent memory issues
+                    if len(self._buffer) < MAX_STREAMING_BUFFER_SIZE:
+                        remaining_capacity = MAX_STREAMING_BUFFER_SIZE - len(self._buffer)
+                        self._buffer += delta.content[:remaining_capacity]
                     self._chunk_count += 1
                     
                     if self._chunk_count % self._inspect_interval == 0:
                         await self._inspect_buffer()
         except Exception as e:
-            logger.debug(f"Error processing async streaming chunk: {e}")
+            logger.warning(f"Error processing async streaming chunk: {e}")
         
         return chunk
     
@@ -421,8 +414,17 @@ class AsyncStreamingInspectionWrapper:
         if not self._buffer or not _should_inspect():
             return
         
+        # Truncate buffer if it exceeds maximum size to prevent memory issues
+        buffer_to_inspect = self._buffer
+        if len(buffer_to_inspect) > MAX_STREAMING_BUFFER_SIZE:
+            logger.warning(
+                f"Streaming buffer exceeded {MAX_STREAMING_BUFFER_SIZE} bytes "
+                f"({len(buffer_to_inspect)} bytes), truncating for inspection"
+            )
+            buffer_to_inspect = buffer_to_inspect[:MAX_STREAMING_BUFFER_SIZE]
+        
         messages_with_response = self._messages + [
-            {"role": "assistant", "content": self._buffer}
+            {"role": "assistant", "content": buffer_to_inspect}
         ]
         
         try:
@@ -449,7 +451,7 @@ def _handle_patcher_error(error: Exception, operation: str) -> Optional[Decision
     Returns:
         Decision.allow() if fail_open=True, raises SecurityPolicyError otherwise
     """
-    fail_open = _state.get_api_mode_fail_open_llm()
+    fail_open = _state.get_api_llm_fail_open()
     
     error_type = type(error).__name__
     logger.warning(f"[{operation}] Inspection error: {error_type}: {error}")
@@ -475,6 +477,10 @@ def _wrap_chat_completions_create(wrapped, instance, args, kwargs):
     """
     model = kwargs.get("model", "unknown")
     
+    # Reset inspection context for each new API call so successive calls
+    # are each independently inspected.
+    set_inspection_context(done=False)
+    
     if not _should_inspect():
         logger.debug(f"[PATCHED CALL] OpenAI.chat.completions.create - inspection skipped (mode=off or already done)")
         return wrapped(*args, **kwargs)
@@ -496,16 +502,16 @@ def _wrap_chat_completions_create(wrapped, instance, args, kwargs):
     
     mode = _state.get_llm_mode()
     integration_mode = _state.get_llm_integration_mode()
-    logger.debug(f"")
     logger.debug(f"╔══════════════════════════════════════════════════════════════")
     logger.debug(f"║ [PATCHED] LLM CALL: {model}")
     logger.debug(f"║ Operation: OpenAI.chat.completions.create | LLM Mode: {mode} | Integration: {integration_mode} | Provider: {provider}")
     logger.debug(f"╚══════════════════════════════════════════════════════════════")
     
     # Gateway mode: route through AI Defense Gateway
-    if _should_use_gateway(provider):
+    gw_settings = resolve_gateway_settings(provider)
+    if gw_settings:
         logger.debug(f"[PATCHED CALL] Gateway mode ({provider}) - routing to AI Defense Gateway")
-        return _handle_gateway_call_sync(kwargs, stream, normalized, metadata, provider, azure_api_version, azure_deployment_name)
+        return _handle_gateway_call_sync(kwargs, stream, normalized, metadata, provider, gw_settings, azure_api_version, azure_deployment_name)
     
     # API mode (default): use LLMInspector for inspection
     # Pre-call inspection with error handling
@@ -557,41 +563,23 @@ def _wrap_chat_completions_create(wrapped, instance, args, kwargs):
     return response
 
 
-def _handle_gateway_call_sync(kwargs: Dict[str, Any], stream: bool, normalized: List[Dict], metadata: Dict, provider: str = "openai", azure_api_version: Optional[str] = None, azure_deployment_name: Optional[str] = None) -> Any:
+def _handle_gateway_call_sync(kwargs: Dict[str, Any], stream: bool, normalized: List[Dict], metadata: Dict, provider: str = "openai", gw_settings=None, azure_api_version: Optional[str] = None, azure_deployment_name: Optional[str] = None) -> Any:
     """
     Handle synchronous gateway call.
     
     Routes the request through provider-specific AI Defense Gateway, which handles 
     inspection and proxying to the actual LLM provider.
-    
-    Args:
-        kwargs: Original call kwargs (model, messages, etc.)
-        stream: Whether streaming is requested
-        normalized: Normalized messages for context
-        metadata: Inspection metadata
-        provider: Provider name - "openai" or "azure_openai"
-        azure_api_version: Azure OpenAI API version (only for azure_openai provider)
-        azure_deployment_name: Azure deployment name (only for azure_openai provider)
-        
-    Returns:
-        Response from gateway (same format as OpenAI response)
     """
     import httpx
     
-    gateway_url = _state.get_provider_gateway_url(provider)
-    gateway_api_key = _state.get_provider_gateway_api_key(provider)
-    
-    if not gateway_url or not gateway_api_key:
-        logger.warning(f"Gateway mode enabled but {provider} gateway not configured")
-        set_inspection_context(decision=Decision.allow(reasons=[f"{provider} gateway not configured"]), done=True)
-        raise SecurityPolicyError(
-            Decision.block(reasons=[f"{provider} gateway not configured"]),
-            f"Gateway mode enabled but AGENTSEC_{provider.upper()}_GATEWAY_URL not set"
-        )
+    gateway_url = gw_settings.url
+    gateway_api_key = gw_settings.api_key
     
     # Build request body (OpenAI-compatible format)
+    # Use gateway_model override if configured (e.g. Azure gateway expects specific model)
+    model_name = gw_settings.gateway_model or kwargs.get("model")
     request_body = {
-        "model": kwargs.get("model"),
+        "model": model_name,
         "messages": kwargs.get("messages", []),
     }
     
@@ -613,28 +601,40 @@ def _handle_gateway_call_sync(kwargs: Dict[str, Any], stream: bool, normalized: 
         
         if provider == "azure_openai":
             # Azure OpenAI gateway URL format:
-            # {gateway_base}/openai/deployments/{deployment_name}/chat/completions[?api-version={api_version}]
-            # Use azure_deployment_name (extracted from client) or fall back to kwargs["model"]
-            deployment_name = azure_deployment_name or kwargs.get("model", "")
+            # {base}/openai/deployments/{deployment}/chat/completions?api-version={ver}
+            deployment_name = gw_settings.gateway_model or azure_deployment_name or kwargs.get("model", "")
             if 'chat/completions' not in full_url:
                 full_url = f"{full_url}/openai/deployments/{deployment_name}/chat/completions"
                 if azure_api_version:
                     full_url = f"{full_url}?api-version={azure_api_version}"
         else:
-            # OpenAI gateway URL format: {gateway_base}/v1/chat/completions
+            # OpenAI gateway: {base}/v1/chat/completions
             if 'chat/completions' not in full_url:
                 full_url = full_url + '/v1/chat/completions'
         
+        # Build auth headers based on provider
+        if provider == "azure_openai":
+            # Azure gateway uses api-key header
+            auth_headers = {
+                "api-key": gateway_api_key or "",
+                "Content-Type": "application/json",
+            }
+        else:
+            auth_headers = {
+                "Authorization": f"Bearer {gateway_api_key}",
+                "Content-Type": "application/json",
+            }
+        
         logger.debug(f"[GATEWAY] Sending request to {provider} gateway: {full_url}")
-        with httpx.Client(timeout=60.0) as client:
+        logger.debug(f"[GATEWAY] Request body model={request_body.get('model')}, keys={list(request_body.keys())}")
+        with httpx.Client(timeout=float(gw_settings.timeout)) as client:
             response = client.post(
                 full_url,
                 json=request_body,
-                headers={
-                    "Authorization": f"Bearer {gateway_api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers=auth_headers,
             )
+            if response.status_code >= 400:
+                logger.error(f"[GATEWAY] {provider} gateway returned {response.status_code}: {response.text[:500]}")
             response.raise_for_status()
             response_data = response.json()
         
@@ -652,14 +652,11 @@ def _handle_gateway_call_sync(kwargs: Dict[str, Any], stream: bool, normalized: 
         
     except httpx.HTTPStatusError as e:
         logger.error(f"[GATEWAY] HTTP error: {e}")
-        if _state.get_gateway_mode_fail_open_llm():
-            # fail_open=True: allow request to proceed by re-raising original error
-            # (let calling code handle the HTTP error naturally)
+        if gw_settings.fail_open:
             logger.warning(f"[GATEWAY] fail_open=True, re-raising original HTTP error for caller to handle")
             set_inspection_context(decision=Decision.allow(reasons=["Gateway error, fail_open=True"]), done=True)
-            raise  # Re-raise original HTTP error, not SecurityPolicyError
+            raise
         else:
-            # fail_open=False: block the request with SecurityPolicyError
             raise SecurityPolicyError(
                 Decision.block(reasons=["Gateway unavailable"]),
                 f"Gateway HTTP error: {e}"
@@ -668,10 +665,10 @@ def _handle_gateway_call_sync(kwargs: Dict[str, Any], stream: bool, normalized: 
         raise
     except Exception as e:
         logger.error(f"[GATEWAY] Error: {e}")
-        if _state.get_gateway_mode_fail_open_llm():
+        if gw_settings.fail_open:
             logger.warning(f"[GATEWAY] fail_open=True, re-raising original error for caller to handle")
             set_inspection_context(decision=Decision.allow(reasons=["Gateway error, fail_open=True"]), done=True)
-            raise  # Re-raise original error
+            raise
         raise
 
 
@@ -782,7 +779,11 @@ def _dict_to_openai_response(data: Dict[str, Any]) -> Any:
             """Return the response data as a dictionary."""
             return self._data
     
-    return ChatCompletion(data)
+    try:
+        return ChatCompletion(data)
+    except (KeyError, TypeError, AttributeError) as e:
+        logger.warning(f"Invalid gateway response structure: {e}")
+        raise ValueError(f"Invalid gateway response: {e}") from e
 
 
 async def _wrap_chat_completions_create_async(wrapped, instance, args, kwargs):
@@ -796,6 +797,10 @@ async def _wrap_chat_completions_create_async(wrapped, instance, args, kwargs):
     - "gateway": Route request through AI Defense Gateway (gateway handles inspection)
     """
     model = kwargs.get("model", "unknown")
+    
+    # Reset inspection context for each new API call so successive calls
+    # are each independently inspected.
+    set_inspection_context(done=False)
     
     if not _should_inspect():
         logger.debug(f"[PATCHED CALL] OpenAI.async.chat.completions.create - inspection skipped")
@@ -818,16 +823,16 @@ async def _wrap_chat_completions_create_async(wrapped, instance, args, kwargs):
     
     mode = _state.get_llm_mode()
     integration_mode = _state.get_llm_integration_mode()
-    logger.debug(f"")
     logger.debug(f"╔══════════════════════════════════════════════════════════════")
     logger.debug(f"║ [PATCHED] LLM CALL (async): {model}")
     logger.debug(f"║ Operation: OpenAI.async.chat.completions.create | LLM Mode: {mode} | Integration: {integration_mode} | Provider: {provider}")
     logger.debug(f"╚══════════════════════════════════════════════════════════════")
     
     # Gateway mode: route through AI Defense Gateway
-    if _should_use_gateway(provider):
+    gw_settings = resolve_gateway_settings(provider)
+    if gw_settings:
         logger.debug(f"[PATCHED CALL] Gateway mode (async, {provider}) - routing to AI Defense Gateway")
-        return await _handle_gateway_call_async(kwargs, stream, normalized, metadata, provider, azure_api_version, azure_deployment_name)
+        return await _handle_gateway_call_async(kwargs, stream, normalized, metadata, provider, gw_settings, azure_api_version, azure_deployment_name)
     
     # API mode (default): use LLMInspector for inspection
     # Pre-call inspection with error handling
@@ -876,40 +881,18 @@ async def _wrap_chat_completions_create_async(wrapped, instance, args, kwargs):
     return response
 
 
-async def _handle_gateway_call_async(kwargs: Dict[str, Any], stream: bool, normalized: List[Dict], metadata: Dict, provider: str = "openai", azure_api_version: Optional[str] = None, azure_deployment_name: Optional[str] = None) -> Any:
-    """
-    Handle asynchronous gateway call.
-    
-    Routes the request through provider-specific AI Defense Gateway, which handles 
-    inspection and proxying to the actual LLM provider.
-    
-    Args:
-        kwargs: Original call kwargs (model, messages, etc.)
-        stream: Whether streaming is requested
-        normalized: Normalized messages for context
-        metadata: Inspection metadata
-        provider: Provider name - "openai" or "azure_openai"
-        azure_api_version: Azure OpenAI API version (only for azure_openai provider)
-        azure_deployment_name: Azure deployment name (only for azure_openai provider)
-        
-    Returns:
-        Response from gateway (same format as OpenAI response)
-    """
+async def _handle_gateway_call_async(kwargs: Dict[str, Any], stream: bool, normalized: List[Dict], metadata: Dict, provider: str = "openai", gw_settings=None, azure_api_version: Optional[str] = None, azure_deployment_name: Optional[str] = None) -> Any:
+    """Handle asynchronous gateway call."""
     import httpx
     
-    gateway_url = _state.get_provider_gateway_url(provider)
-    gateway_api_key = _state.get_provider_gateway_api_key(provider)
-    
-    if not gateway_url or not gateway_api_key:
-        logger.warning(f"Gateway mode enabled but {provider} gateway not configured")
-        raise SecurityPolicyError(
-            Decision.block(reasons=[f"{provider} gateway not configured"]),
-            f"Gateway mode enabled but AGENTSEC_{provider.upper()}_GATEWAY_URL not set"
-        )
+    gateway_url = gw_settings.url
+    gateway_api_key = gw_settings.api_key
     
     # Build request body (OpenAI-compatible format)
+    # Use gateway_model override if configured (e.g. Azure gateway expects specific model)
+    model_name = gw_settings.gateway_model or kwargs.get("model")
     request_body = {
-        "model": kwargs.get("model"),
+        "model": model_name,
         "messages": kwargs.get("messages", []),
     }
     
@@ -931,28 +914,40 @@ async def _handle_gateway_call_async(kwargs: Dict[str, Any], stream: bool, norma
         
         if provider == "azure_openai":
             # Azure OpenAI gateway URL format:
-            # {gateway_base}/openai/deployments/{deployment_name}/chat/completions[?api-version={api_version}]
-            # Use azure_deployment_name (extracted from client) or fall back to kwargs["model"]
-            deployment_name = azure_deployment_name or kwargs.get("model", "")
+            # {base}/openai/deployments/{deployment}/chat/completions?api-version={ver}
+            deployment_name = gw_settings.gateway_model or azure_deployment_name or kwargs.get("model", "")
             if 'chat/completions' not in full_url:
                 full_url = f"{full_url}/openai/deployments/{deployment_name}/chat/completions"
                 if azure_api_version:
                     full_url = f"{full_url}?api-version={azure_api_version}"
         else:
-            # OpenAI gateway URL format: {gateway_base}/v1/chat/completions
+            # OpenAI gateway: {base}/v1/chat/completions
             if 'chat/completions' not in full_url:
                 full_url = full_url + '/v1/chat/completions'
         
+        # Build auth headers based on provider
+        if provider == "azure_openai":
+            # Azure gateway uses api-key header
+            auth_headers = {
+                "api-key": gateway_api_key or "",
+                "Content-Type": "application/json",
+            }
+        else:
+            auth_headers = {
+                "Authorization": f"Bearer {gateway_api_key}",
+                "Content-Type": "application/json",
+            }
+        
         logger.debug(f"[GATEWAY] Sending async request to {provider} gateway: {full_url}")
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        logger.debug(f"[GATEWAY] Request body model={request_body.get('model')}, keys={list(request_body.keys())}")
+        async with httpx.AsyncClient(timeout=float(gw_settings.timeout)) as client:
             response = await client.post(
                 full_url,
                 json=request_body,
-                headers={
-                    "Authorization": f"Bearer {gateway_api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers=auth_headers,
             )
+            if response.status_code >= 400:
+                logger.error(f"[GATEWAY] {provider} gateway returned {response.status_code}: {response.text[:500]}")
             response.raise_for_status()
             response_data = response.json()
         
@@ -971,13 +966,11 @@ async def _handle_gateway_call_async(kwargs: Dict[str, Any], stream: bool, norma
         
     except httpx.HTTPStatusError as e:
         logger.error(f"[GATEWAY] HTTP error: {e}")
-        if _state.get_gateway_mode_fail_open_llm():
-            # fail_open=True: allow request to proceed by re-raising original error
+        if gw_settings.fail_open:
             logger.warning(f"[GATEWAY] fail_open=True, re-raising original HTTP error for caller to handle")
             set_inspection_context(decision=Decision.allow(reasons=["Gateway error, fail_open=True"]), done=True)
-            raise  # Re-raise original HTTP error, not SecurityPolicyError
+            raise
         else:
-            # fail_open=False: block the request with SecurityPolicyError
             raise SecurityPolicyError(
                 Decision.block(reasons=["Gateway unavailable"]),
                 f"Gateway HTTP error: {e}"
@@ -986,10 +979,10 @@ async def _handle_gateway_call_async(kwargs: Dict[str, Any], stream: bool, norma
         raise
     except Exception as e:
         logger.error(f"[GATEWAY] Async error: {e}")
-        if _state.get_gateway_mode_fail_open_llm():
+        if gw_settings.fail_open:
             logger.warning(f"[GATEWAY] fail_open=True, re-raising original error for caller to handle")
             set_inspection_context(decision=Decision.allow(reasons=["Gateway error, fail_open=True"]), done=True)
-            raise  # Re-raise original error
+            raise
         raise
 
 
@@ -1068,6 +1061,7 @@ def _wrap_responses_create(wrapped, instance, args, kwargs):
     Wraps LLM inspection with error handling to ensure LLM calls
     never crash due to inspection errors, respecting llm_fail_open setting.
     """
+    set_inspection_context(done=False)
     if not _should_inspect():
         return wrapped(*args, **kwargs)
     
@@ -1121,6 +1115,7 @@ async def _wrap_responses_create_async(wrapped, instance, args, kwargs):
     Wraps LLM inspection with error handling to ensure LLM calls
     never crash due to inspection errors, respecting llm_fail_open setting.
     """
+    set_inspection_context(done=False)
     if not _should_inspect():
         return await wrapped(*args, **kwargs)
     

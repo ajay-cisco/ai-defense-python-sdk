@@ -125,9 +125,9 @@ AI_DEFENSE_API_MODE_LLM_API_KEY=your-key-here
 # MCP Server (optional)
 MCP_SERVER_URL=https://mcp.deepwiki.com/mcp
 
-# agentsec mode: off | on_monitor | on_enforce
-AGENTSEC_API_MODE_LLM=on_monitor
-AGENTSEC_API_MODE_MCP=on_monitor
+# agentsec mode: off | monitor | enforce
+AGENTSEC_API_MODE_LLM=monitor
+AGENTSEC_API_MODE_MCP=monitor
 
 # Provider-specific credentials (set based on provider)
 # AWS Bedrock
@@ -155,7 +155,7 @@ This example supports 4 LLM providers. LangChain adapters are used automatically
 |----------|-----------------|-------------|
 | AWS Bedrock | `ChatBedrock` | `config/config-bedrock.yaml` |
 | Azure OpenAI | `AzureChatOpenAI` | `config/config-azure.yaml` |
-| GCP Vertex AI | `ChatVertexAI` | `config/config-vertex.yaml` |
+| GCP Vertex AI | `ChatGoogleGenerativeAI / ChatVertexAI` | `config/config-vertex.yaml` |
 | OpenAI | `ChatOpenAI` | `config/config-openai.yaml` |
 
 See the [examples README](../../README.md) for full authentication method documentation.
@@ -209,8 +209,8 @@ response = llm_with_tools.invoke([HumanMessage(content="Hello")])
 | Mode | Behavior |
 |------|----------|
 | `off` | No inspection, no patching |
-| `on_monitor` | Inspect & log, never block |
-| `on_enforce` | Inspect & block policy violations |
+| `monitor` | Inspect & log, never block |
+| `enforce` | Inspect & block policy violations |
 
 ## Integration Tests
 

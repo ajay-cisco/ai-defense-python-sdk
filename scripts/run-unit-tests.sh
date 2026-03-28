@@ -25,6 +25,12 @@ echo "  Running All Unit Tests"
 echo -e "==============================================${NC}"
 echo ""
 
+# Install dependencies
+echo "Installing dependencies..."
+poetry install --with dev --quiet
+echo -e "${GREEN}Dependencies installed.${NC}"
+echo ""
+
 # Collect all unit test directories
 UNIT_TEST_DIRS=(
     "aidefense/tests"
@@ -38,6 +44,7 @@ UNIT_TEST_DIRS=(
     "examples/agentsec/2-agent-frameworks/_shared/tests"
     "examples/agentsec/3-agent-runtimes/amazon-bedrock-agentcore/tests/unit"
     "examples/agentsec/3-agent-runtimes/gcp-vertex-ai-agent-engine/tests/unit"
+    "examples/agentsec/3-agent-runtimes/microsoft-foundry/tests/unit"
 )
 
 # Build pytest paths (only include directories that exist)

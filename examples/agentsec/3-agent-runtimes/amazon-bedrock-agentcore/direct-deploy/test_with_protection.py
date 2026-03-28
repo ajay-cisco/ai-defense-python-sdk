@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import sys
+import uuid
 from pathlib import Path
 
 # Enable DEBUG logging for agentsec to capture inspection logs
@@ -32,31 +33,36 @@ if _shared_env.exists():
     load_dotenv(_shared_env)
 
 # =============================================================================
-# Configure agentsec protection (BEFORE importing boto3)
+# Configure agentsec via agentsec.yaml (BEFORE importing boto3)
 # =============================================================================
 from aidefense.runtime import agentsec
 
+# Resolve agentsec.yaml path
+_yaml_paths = [
+    Path("/app/agentsec.yaml"),  # Container deployment
+    Path(__file__).parent.parent.parent.parent / "agentsec.yaml",  # examples/agentsec/agentsec.yaml
+]
+
+_yaml_config = None
+for _yp in _yaml_paths:
+    if _yp.exists():
+        _yaml_config = str(_yp)
+        break
+
+# Allow integration test scripts to override YAML integration mode via env vars
+_protect_kwargs = {}
+if os.getenv("AGENTSEC_LLM_INTEGRATION_MODE"):
+    _protect_kwargs["llm_integration_mode"] = os.getenv("AGENTSEC_LLM_INTEGRATION_MODE")
+if os.getenv("AGENTSEC_MCP_INTEGRATION_MODE"):
+    _protect_kwargs["mcp_integration_mode"] = os.getenv("AGENTSEC_MCP_INTEGRATION_MODE")
+
 agentsec.protect(
-    llm_integration_mode=os.getenv("AGENTSEC_LLM_INTEGRATION_MODE", "api"),
-    api_mode_llm=os.getenv("AGENTSEC_API_MODE_LLM", "on_monitor"),
-    api_mode_llm_endpoint=os.getenv("AI_DEFENSE_API_MODE_LLM_ENDPOINT"),
-    api_mode_llm_api_key=os.getenv("AI_DEFENSE_API_MODE_LLM_API_KEY"),
-    api_mode_fail_open_llm=True,
-    providers={
-        "bedrock": {
-            "gateway_url": os.getenv("AGENTSEC_BEDROCK_GATEWAY_URL"),
-            "gateway_api_key": os.getenv("AGENTSEC_BEDROCK_GATEWAY_API_KEY"),
-        },
-        "agentcore": {
-            "gateway_url": os.getenv("AGENTSEC_AGENTCORE_GATEWAY_URL"),
-        },
-    },
-    auto_dotenv=False,
+    config=_yaml_config,
+    auto_dotenv=False,  # We already loaded .env manually
+    **_protect_kwargs,
 )
 
-print(f"[agentsec] Mode: {os.getenv('AGENTSEC_API_MODE_LLM', 'on_monitor')} | "
-      f"Integration: {os.getenv('AGENTSEC_LLM_INTEGRATION_MODE', 'api')} | "
-      f"Patched: {agentsec.get_patched_clients()}")
+print(f"[agentsec] Patched: {agentsec.get_patched_clients()}")
 
 # =============================================================================
 # Now import boto3 (AFTER agentsec.protect())
@@ -65,21 +71,29 @@ import boto3
 from botocore.config import Config
 
 
-def invoke_agent_with_boto3(prompt: str):
+def invoke_agent_with_boto3(prompt: str, agent_name: str = "agentcore_sre_direct"):
     """Invoke the AgentCore agent using boto3 (protected by agentsec).
     
     This method uses the boto3 SDK directly, ensuring both REQUEST and RESPONSE
     go through agentsec's patched client for full AI Defense inspection.
+    
+    Args:
+        prompt: The prompt to send to the agent
+        agent_name: The agent name to use (default: agentcore_sre_direct)
     """
     import yaml
     config_file = Path(__file__).parent.parent / ".bedrock_agentcore.yaml"
     
     with open(config_file) as f:
         config = yaml.safe_load(f)
-        default_agent = config.get("default_agent", "agentcore_sre_direct")
-        agent_config = config.get("agents", {}).get(default_agent, {})
+        # Use specified agent name, not default_agent from config
+        agent_config = config.get("agents", {}).get(agent_name, {})
+        if not agent_config:
+            raise ValueError(f"Agent '{agent_name}' not found in config. Available: {list(config.get('agents', {}).keys())}")
         agent_arn = agent_config.get("bedrock_agentcore", {}).get("agent_arn")
         session_id = agent_config.get("bedrock_agentcore", {}).get("agent_session_id")
+        if not session_id:
+            session_id = str(uuid.uuid4())
     
     print(f"\n[client] Agent ARN: {agent_arn}")
     print(f"[client] Session: {session_id}")
@@ -113,10 +127,13 @@ def invoke_agent_with_boto3(prompt: str):
 
 if __name__ == "__main__":
     prompt = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "Hello, check the health of the payments service"
+    # Allow specifying agent via environment variable (for testing different deploy modes)
+    agent_name = os.getenv("AGENTCORE_AGENT_NAME", "agentcore_sre_direct")
     
     print("=" * 60)
     print("Testing AgentCore with agentsec protection (boto3 direct)")
     print("=" * 60)
+    print(f"  Agent: {agent_name}")
     
     # Direct boto3 call - both request AND response are protected by agentsec
     print("\n>>> Direct boto3 call (protected by agentsec)")
@@ -124,7 +141,7 @@ if __name__ == "__main__":
     print("    Response inspection: YES")
     
     try:
-        invoke_agent_with_boto3(prompt)
+        invoke_agent_with_boto3(prompt, agent_name=agent_name)
         print("\n[SUCCESS] Test completed - both request and response were inspected")
     except agentsec.SecurityPolicyError as e:
         print(f"\n[BLOCKED] AI Defense blocked the request: {e}")

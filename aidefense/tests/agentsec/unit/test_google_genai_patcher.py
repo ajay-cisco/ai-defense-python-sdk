@@ -235,8 +235,7 @@ class TestPatcherInfrastructure:
         # Initialize with off mode
         _state.set_state(
             initialized=True,
-            api_mode_llm="off",
-            api_mode_mcp="off",
+            api_mode={"llm": {"mode": "off"}, "mcp": {"mode": "off"}},
             llm_integration_mode="api",
             mcp_integration_mode="api",
         )
@@ -250,7 +249,7 @@ class TestPatcherInfrastructure:
         reset_registry()
     
     def test_should_inspect_monitor_mode(self):
-        """Test _should_inspect returns True when mode is on_monitor."""
+        """Test _should_inspect returns True when mode is monitor."""
         from aidefense.runtime.agentsec.patchers.google_genai import _should_inspect
         from aidefense.runtime.agentsec import _state
         from aidefense.runtime.agentsec.patchers import reset_registry
@@ -262,8 +261,7 @@ class TestPatcherInfrastructure:
         # Initialize with monitor mode
         _state.set_state(
             initialized=True,
-            api_mode_llm="on_monitor",
-            api_mode_mcp="on_monitor",
+            api_mode={"llm": {"mode": "monitor"}, "mcp": {"mode": "monitor"}},
             llm_integration_mode="api",
             mcp_integration_mode="api",
         )
@@ -362,6 +360,74 @@ class TestStreamingWrapper:
         assert hasattr(wrapper, '__anext__')
 
 
+class TestGoogleGenAIGatewayAuth:
+    """Tests for auth mode dispatch in google_genai gateway handler."""
+
+    @patch("httpx.Client")
+    def test_gateway_google_adc_uses_build_header(self, mock_httpx_client):
+        """Verify _build_google_auth_header is called when auth_mode == google_adc."""
+        from aidefense.runtime.agentsec.patchers.google_genai import _handle_google_genai_gateway_call
+        from aidefense.runtime.agentsec.gateway_settings import GatewaySettings
+
+        gw = GatewaySettings(
+            url="https://gw.example.com",
+            auth_mode="google_adc",
+            gcp_project="my-project",
+            gcp_location="us-central1",
+        )
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "candidates": [{"content": {"role": "model", "parts": [{"text": "hi"}]}}]
+        }
+        mock_response.raise_for_status = MagicMock()
+        mock_client_instance = MagicMock()
+        mock_client_instance.post.return_value = mock_response
+        mock_httpx_client.return_value.__enter__ = MagicMock(return_value=mock_client_instance)
+        mock_httpx_client.return_value.__exit__ = MagicMock(return_value=False)
+
+        with patch("aidefense.runtime.agentsec.patchers._google_common._build_google_auth_header",
+                    return_value={"Authorization": "Bearer adc-tok"}) as mock_build:
+            _handle_google_genai_gateway_call("gemini-2.0-flash", "Hello", config=None, gw_settings=gw)
+
+        mock_build.assert_called_once_with(gw)
+        call_kwargs = mock_client_instance.post.call_args
+        headers = call_kwargs[1]["headers"] if "headers" in call_kwargs[1] else call_kwargs.kwargs["headers"]
+        assert headers["Authorization"] == "Bearer adc-tok"
+
+    @patch("httpx.Client")
+    def test_gateway_api_key_mode(self, mock_httpx_client):
+        """Verify existing api_key behavior unchanged."""
+        from aidefense.runtime.agentsec.patchers.google_genai import _handle_google_genai_gateway_call
+        from aidefense.runtime.agentsec.gateway_settings import GatewaySettings
+
+        gw = GatewaySettings(
+            url="https://gw.example.com",
+            auth_mode="api_key",
+            api_key="my-api-key",
+            gcp_project="my-project",
+            gcp_location="us-central1",
+        )
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "candidates": [{"content": {"role": "model", "parts": [{"text": "hi"}]}}]
+        }
+        mock_response.raise_for_status = MagicMock()
+        mock_client_instance = MagicMock()
+        mock_client_instance.post.return_value = mock_response
+        mock_httpx_client.return_value.__enter__ = MagicMock(return_value=mock_client_instance)
+        mock_httpx_client.return_value.__exit__ = MagicMock(return_value=False)
+
+        _handle_google_genai_gateway_call("gemini-2.0-flash", "Hello", config=None, gw_settings=gw)
+
+        call_kwargs = mock_client_instance.post.call_args
+        headers = call_kwargs[1]["headers"] if "headers" in call_kwargs[1] else call_kwargs.kwargs["headers"]
+        assert headers["Authorization"] == "Bearer my-api-key"
+
+
 class TestIntegrationWithAgentsec:
     """Test integration with the main agentsec module."""
     
@@ -384,12 +450,15 @@ class TestIntegrationWithAgentsec:
         
         # Should not raise when configuring google_genai provider
         agentsec.protect(
-            api_mode_llm="off",
-            api_mode_mcp="off",
-            providers={
-                "google_genai": {
-                    "gateway_url": "https://test-gateway.example.com",
-                    "gateway_api_key": "test-key",
+            api_mode={"llm": {"mode": "off"}, "mcp": {"mode": "off"}},
+            gateway_mode={
+                "llm_gateways": {
+                    "google-genai-1": {
+                        "gateway_url": "https://test-gateway.example.com",
+                        "gateway_api_key": "test-key",
+                        "provider": "google_genai",
+                        "default": True,
+                    }
                 }
             },
             auto_dotenv=False,

@@ -27,15 +27,23 @@ Usage:
 """
 
 import asyncio
+import logging
 import os
 import sys
 import time
 from pathlib import Path
 from typing import List, Dict, Any
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+# Configurable timeout from environment
+MCP_TIMEOUT = int(os.getenv("MCP_TIMEOUT", "60"))
+
 # Load shared .env file (before agentsec.protect())
 from dotenv import load_dotenv
-shared_env = Path(__file__).parent.parent / "_shared" / ".env"
+shared_env = Path(__file__).parent.parent.parent / ".env"
 if shared_env.exists():
     load_dotenv(shared_env)
 
@@ -43,25 +51,28 @@ if shared_env.exists():
 # MINIMAL agentsec integration: Just 2 lines!
 # =============================================================================
 from aidefense.runtime import agentsec
-agentsec.protect()  # Reads config from .env, patches clients
+config_path = str(Path(__file__).parent.parent.parent / "agentsec.yaml")
+# Allow integration test script to override YAML integration mode via env vars
+_protect_kwargs = {}
+if os.getenv("AGENTSEC_LLM_INTEGRATION_MODE"):
+    _protect_kwargs["llm_integration_mode"] = os.getenv("AGENTSEC_LLM_INTEGRATION_MODE")
+if os.getenv("AGENTSEC_MCP_INTEGRATION_MODE"):
+    _protect_kwargs["mcp_integration_mode"] = os.getenv("AGENTSEC_MCP_INTEGRATION_MODE")
+agentsec.protect(config=config_path, **_protect_kwargs)
 
 # That's it! Now import your frameworks normally
 #
-# Alternative: Configure Gateway mode programmatically (provider-specific):
-#   agentsec.protect(
-#       llm_integration_mode="gateway",
-#       providers={"openai": {"gateway_url": "https://gateway.../conn", "gateway_api_key": "key"}},
-#       auto_dotenv=False,
-#   )
-from agentsec.exceptions import SecurityPolicyError
+# Alternative: Configure inline (for quick testing):
+#   agentsec.protect(api_mode={"llm": {"mode": "monitor"}})
+from aidefense.runtime.agentsec.exceptions import SecurityPolicyError
 
-print(f"[agentsec] LLM: {os.getenv('AGENTSEC_API_MODE_LLM', 'monitor')} | Integration: {os.getenv('AGENTSEC_LLM_INTEGRATION_MODE', 'api')} | Patched: {agentsec.get_patched_clients()}")
+print(f"[agentsec] Patched: {agentsec.get_patched_clients()}")
 
 # =============================================================================
 # Import shared provider infrastructure
 # =============================================================================
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from _shared import load_config, create_provider
+from _shared import load_config, create_provider, validate_url, URLValidationError
 
 # =============================================================================
 # Import LangChain libraries (AFTER agentsec.protect())
@@ -95,10 +106,18 @@ def fetch_url(url: str) -> str:
     Returns:
         The text content of the URL
     """
-    print(f"\n[TOOL CALL] fetch_url(url='{url}')", flush=True)
+    logger.info(f"fetch_url called: url='{url}'")
+    
+    # Validate URL to prevent SSRF attacks
+    try:
+        validate_url(url)
+    except URLValidationError as e:
+        logger.warning(f"URL validation failed: {e}")
+        return f"Error: Invalid URL - {e}"
+    
     global _mcp_session
     if _mcp_session is None:
-        print("[DEBUG] MCP not connected!", flush=True)
+        logger.warning("MCP not connected")
         return "Error: MCP not connected"
     
     # Run async MCP call in sync context
@@ -111,17 +130,15 @@ def fetch_url(url: str) -> str:
     async def _call_mcp():
         start = time.time()
         result = await _mcp_session.call_tool('fetch', {'url': url})
-        content = result.content[0].text if result.content else "No content"
+        content = next((c.text for c in (result.content or []) if hasattr(c, "text")), "No content")
         elapsed = time.time() - start
-        print(f"[TOOL] Got response ({len(content)} chars) in {elapsed:.1f}s", flush=True)
+        logger.info(f"Got response ({len(content)} chars) in {elapsed:.1f}s")
         return content
     
     try:
         return loop.run_until_complete(_call_mcp())
     except Exception as e:
-        print(f"[TOOL ERROR] {type(e).__name__}: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
+        logger.exception(f"Tool error: {type(e).__name__}: {e}")
         return f"Error: {e}"
 
 
@@ -142,7 +159,7 @@ def run_agent_loop(llm_with_tools, tools_dict: Dict[str, Any], messages: List, m
     This is the modern LangChain pattern that replaces AgentExecutor.
     """
     for iteration in range(max_iterations):
-        print(f"[DEBUG] Agent iteration {iteration + 1}/{max_iterations}", flush=True)
+        logger.debug(f"Agent iteration {iteration + 1}/{max_iterations}")
         
         # Invoke LLM
         response = llm_with_tools.invoke(messages)
@@ -159,7 +176,7 @@ def run_agent_loop(llm_with_tools, tools_dict: Dict[str, Any], messages: List, m
             tool_args = tool_call["args"]
             tool_id = tool_call["id"]
             
-            print(f"[DEBUG] Tool call: {tool_name}({tool_args})", flush=True)
+            logger.debug(f"Tool call: {tool_name}({tool_args})")
             
             # Execute the tool
             if tool_name in tools_dict:
@@ -185,7 +202,7 @@ async def run_agent(initial_message: str = None):
     """Run the LangChain Agent with MCP tools."""
     global _mcp_session
     
-    print("[DEBUG] run_agent started", flush=True)
+    logger.debug("run_agent started")
     
     # Load configuration and create provider
     try:
@@ -205,8 +222,8 @@ async def run_agent(initial_message: str = None):
     mcp_url = os.getenv("MCP_SERVER_URL")
     model_id = provider.model_id
     
-    print(f"[DEBUG] MCP URL: {mcp_url}", flush=True)
-    print(f"[DEBUG] Model ID: {model_id}", flush=True)
+    logger.debug(f"MCP URL: {mcp_url}")
+    logger.debug(f"Model ID: {model_id}")
     
     # -------------------------------------------------------------------------
     # Connect to MCP if URL configured
@@ -215,26 +232,26 @@ async def run_agent(initial_message: str = None):
     session_context = None
     
     if mcp_url:
-        print(f"[mcp] Connecting to {mcp_url}...", flush=True)
+        logger.info(f"Connecting to MCP server: {mcp_url}")
         try:
-            mcp_context = streamablehttp_client(mcp_url, timeout=60)
+            mcp_context = streamablehttp_client(mcp_url, timeout=MCP_TIMEOUT)
             read, write, _ = await mcp_context.__aenter__()
             session_context = ClientSession(read, write)
             _mcp_session = await session_context.__aenter__()
             await _mcp_session.initialize()
             tools_list = await _mcp_session.list_tools()
-            print(f"[mcp] Connected! Tools: {[t.name for t in tools_list.tools]}", flush=True)
+            logger.info(f"MCP connected. Tools: {[t.name for t in tools_list.tools]}")
         except Exception as e:
-            print(f"[mcp] Connection failed: {e}", flush=True)
+            logger.warning(f"MCP connection failed: {e}")
             _mcp_session = None
     
     # -------------------------------------------------------------------------
     # Create LLM instance from provider
     # -------------------------------------------------------------------------
-    print(f"[agent] Creating LLM with model: {model_id}", flush=True)
+    logger.info(f"Creating LLM with model: {model_id}")
     
     llm = provider.get_langchain_llm()
-    print("[DEBUG] LLM created", flush=True)
+    logger.debug("LLM created")
     
     # -------------------------------------------------------------------------
     # Setup Tools and Bind to LLM (Modern LangChain 1.0+ Pattern)
@@ -246,18 +263,19 @@ async def run_agent(initial_message: str = None):
     # -------------------------------------------------------------------------
     
     # Define tools (fetch_url if MCP connected, otherwise empty)
-    tools = [fetch_url] if _mcp_session else []
+    # Register tools if MCP URL is configured (tool calls create fresh connections)
+    tools = [fetch_url] if mcp_url else []
     tools_dict = {t.name: t for t in tools}
     
-    print(f"[DEBUG] Tools: {list(tools_dict.keys())}", flush=True)
+    logger.debug(f"Tools: {list(tools_dict.keys())}")
     
     # Bind tools to LLM (modern LangChain 1.0+ approach)
     if tools:
         llm_with_tools = llm.bind_tools(tools)
-        print("[DEBUG] Tools bound to LLM", flush=True)
+        logger.debug("Tools bound to LLM")
     else:
         llm_with_tools = llm
-        print("[DEBUG] No tools to bind (MCP not connected)", flush=True)
+        logger.debug("No tools to bind (MCP not connected)")
     
     print("\n" + "=" * 60, flush=True)
     print("  LangChain Agent + agentsec + MCP", flush=True)
@@ -265,10 +283,14 @@ async def run_agent(initial_message: str = None):
     print("=" * 60, flush=True)
     
     # System message for the agent
-    system_message = SystemMessage(content="""You are a helpful assistant with access to tools.
-When asked to fetch a URL, use the fetch_url tool.
-After using a tool, summarize the results clearly for the user.
-Be concise but informative in your responses.""")
+    system_message = SystemMessage(content="""You are a helpful assistant with access to the fetch_url tool.
+
+CRITICAL INSTRUCTIONS:
+1. When the user asks to fetch a URL or asks about a webpage, ALWAYS use the fetch_url tool.
+2. NEVER guess what a page contains - always use the tool to get actual content.
+3. After fetching, summarize the results clearly for the user.
+
+Tool usage: fetch_url(url='https://example.com')""")
     
     # -------------------------------------------------------------------------
     # Handle single message mode
@@ -280,7 +302,7 @@ Be concise but informative in your responses.""")
             messages = [system_message, HumanMessage(content=initial_message)]
             response = run_agent_loop(llm_with_tools, tools_dict, messages)
             elapsed = time.time() - start
-            print(f"[DEBUG] Agent completed in {elapsed:.1f}s", flush=True)
+            logger.debug(f"Agent completed in {elapsed:.1f}s")
             print(f"\nAgent: {response}", flush=True)
         except SecurityPolicyError as e:
             print(f"\n[BLOCKED] {e.decision.action}: {e.decision.reasons}", flush=True)
@@ -346,17 +368,17 @@ async def cleanup_mcp(session_context, mcp_context):
             await session_context.__aexit__(None, None, None)
     except Exception as e:
         # Log cleanup errors at debug level (expected during shutdown)
-        print(f"[DEBUG] MCP session cleanup: {type(e).__name__}", flush=True)
+        logger.debug(f"MCP session cleanup: {type(e).__name__}")
     try:
         if mcp_context:
             await mcp_context.__aexit__(None, None, None)
     except Exception as e:
-        print(f"[DEBUG] MCP context cleanup: {type(e).__name__}", flush=True)
+        logger.debug(f"MCP context cleanup: {type(e).__name__}")
 
 
 def main():
     """Entry point."""
-    print("[DEBUG] main() started", flush=True)
+    logger.debug("main() started")
     import warnings
     warnings.filterwarnings("ignore", category=RuntimeWarning)
     
@@ -375,19 +397,19 @@ def main():
     
     # Get initial message from command line if provided
     initial_message = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else None
-    print(f"[DEBUG] Initial message: {initial_message}", flush=True)
+    logger.debug(f"Initial message: {initial_message}")
     
     loop = asyncio.new_event_loop()
     loop.set_exception_handler(exception_handler)
     try:
-        print("[DEBUG] Starting event loop...", flush=True)
+        logger.debug("Starting event loop")
         loop.run_until_complete(run_agent(initial_message))
     finally:
         # Suppress shutdown errors
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Error during async generator shutdown: {e}")
         loop.close()
 
 

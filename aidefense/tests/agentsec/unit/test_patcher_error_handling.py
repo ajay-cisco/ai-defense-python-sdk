@@ -34,8 +34,8 @@ class TestOpenAIPatcherErrorHandling:
                 with patch("aidefense.runtime.agentsec.patchers.openai.get_inspection_context") as mock_ctx:
                     mock_ctx.return_value.metadata = {}
                     with patch("aidefense.runtime.agentsec.patchers.openai._state") as mock_state:
-                        mock_state.get_llm_mode.return_value = "on_monitor"
-                        mock_state.get_config.return_value = MagicMock(llm_fail_open=True)
+                        mock_state.get_llm_mode.return_value = "monitor"
+                        mock_state.get_api_llm_fail_open.return_value = True
                         
                         # Should not raise, should allow the call
                         result = _wrap_chat_completions_create(
@@ -76,19 +76,6 @@ class TestOpenAIPatcherErrorHandling:
                 # Should iterate without crashing
                 chunks = list(wrapper)
                 assert len(chunks) == 2
-
-
-class TestBedrockPatcherErrorHandling:
-    """Test error handling in Bedrock patcher."""
-
-    def test_bedrock_patcher_handles_errors(self):
-        """Test that Bedrock patcher exists and handles errors."""
-        try:
-            from aidefense.runtime.agentsec.patchers import bedrock
-            assert hasattr(bedrock, 'patch_bedrock')
-        except ImportError:
-            pytest.skip("Bedrock patcher not available")
-
 
 
 

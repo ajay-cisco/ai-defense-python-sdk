@@ -1,7 +1,7 @@
 """Agent factory with agentsec protection.
 
-This module configures agentsec with explicit gateway/API URLs for LLM and MCP,
-then creates a Strands agent with demo tools.
+This module configures agentsec via agentsec.yaml, then creates a Strands
+agent with demo tools.
 
 The agentsec.protect() call patches botocore to intercept:
 - Bedrock calls (InvokeModel, Converse, etc.)
@@ -22,10 +22,13 @@ from dotenv import load_dotenv
 
 # Try multiple .env locations in order of priority:
 # 1. /app/.env (container deployment)
-# 2. examples/.env (local development)
-# 3. agentcore/.env (fallback)
+# 2. Lambda task root (Lambda deployment)
+# 3. examples/.env (local development)
+# 4. agentcore/.env (fallback)
+_lambda_task_root = os.environ.get("LAMBDA_TASK_ROOT", "")
 _env_paths = [
     Path("/app/.env"),  # Container deployment
+    *([ Path(_lambda_task_root) / ".env" ] if _lambda_task_root else []),  # Lambda deployment
     Path(__file__).parent.parent.parent.parent / ".env",  # examples/.env
     Path(__file__).parent.parent / ".env",  # agentcore/.env
 ]
@@ -35,63 +38,54 @@ for _env_path in _env_paths:
         load_dotenv(_env_path)
         break
 
+# In Lambda, clear profile-based AWS auth vars loaded from .env.
+# Lambda uses its IAM execution role automatically; AWS_PROFILE would cause
+# "ProfileNotFound" since ~/.aws/credentials doesn't exist in Lambda.
+if _lambda_task_root:
+    for _var in ("AWS_PROFILE", "AWS_AUTH_METHOD"):
+        os.environ.pop(_var, None)
+
 # =============================================================================
-# Configure agentsec with explicit gateway/API URLs for LLM and MCP
+# Configure agentsec via agentsec.yaml
 # =============================================================================
 from aidefense.runtime import agentsec
 
+# Resolve agentsec.yaml path (container vs Lambda vs local development)
+_yaml_paths = [
+    Path("/app/agentsec.yaml"),  # Container deployment
+    *([ Path(_lambda_task_root) / "agentsec.yaml" ] if _lambda_task_root else []),  # Lambda deployment
+    Path(__file__).parent.parent.parent.parent / "agentsec.yaml",  # examples/agentsec/agentsec.yaml
+]
+
+_yaml_config = None
+for _yp in _yaml_paths:
+    if _yp.exists():
+        _yaml_config = str(_yp)
+        break
+
 
 def configure_agentsec():
-    """Configure agentsec protection with explicit URLs.
+    """Configure agentsec protection via agentsec.yaml.
     
     This function should be called BEFORE creating any boto3 clients or agents.
-    It configures agentsec with explicit gateway/API URLs for both LLM and MCP.
-    
-    Reads configuration from environment variables:
-    - AGENTSEC_LLM_INTEGRATION_MODE: "api" (inspection) or "gateway" (proxy)
-    - AGENTSEC_MCP_INTEGRATION_MODE: "api" (inspection) or "gateway" (proxy)
-    - API mode settings: AI_DEFENSE_API_MODE_LLM_ENDPOINT, etc.
-    - Gateway mode settings: AGENTSEC_BEDROCK_GATEWAY_URL, etc.
+    All gateway/API mode settings (URLs, keys, modes, fail-open, retry, etc.)
+    are defined in agentsec.yaml. Secrets are referenced via ${VAR_NAME} and
+    resolved from the environment (populated by load_dotenv above).
     """
+    # Allow integration test scripts to override YAML integration mode via env vars
+    _protect_kwargs = {}
+    if os.getenv("AGENTSEC_LLM_INTEGRATION_MODE"):
+        _protect_kwargs["llm_integration_mode"] = os.getenv("AGENTSEC_LLM_INTEGRATION_MODE")
+    if os.getenv("AGENTSEC_MCP_INTEGRATION_MODE"):
+        _protect_kwargs["mcp_integration_mode"] = os.getenv("AGENTSEC_MCP_INTEGRATION_MODE")
+
     agentsec.protect(
-        # Integration mode: "api" (inspection) or "gateway" (proxy)
-        llm_integration_mode=os.getenv("AGENTSEC_LLM_INTEGRATION_MODE", "api"),
-        mcp_integration_mode=os.getenv("AGENTSEC_MCP_INTEGRATION_MODE", "api"),
-        
-        # API Mode Configuration (when integration_mode="api")
-        api_mode_llm=os.getenv("AGENTSEC_API_MODE_LLM", "on_monitor"),
-        api_mode_mcp=os.getenv("AGENTSEC_API_MODE_MCP", "on_monitor"),
-        api_mode_llm_endpoint=os.getenv("AI_DEFENSE_API_MODE_LLM_ENDPOINT"),
-        api_mode_llm_api_key=os.getenv("AI_DEFENSE_API_MODE_LLM_API_KEY"),
-        api_mode_mcp_endpoint=os.getenv("AI_DEFENSE_API_MODE_MCP_ENDPOINT"),
-        api_mode_mcp_api_key=os.getenv("AI_DEFENSE_API_MODE_MCP_API_KEY"),
-        
-        # Fail-open settings
-        api_mode_fail_open_llm=os.getenv("AGENTSEC_API_MODE_FAIL_OPEN_LLM", "true").lower() == "true",
-        api_mode_fail_open_mcp=os.getenv("AGENTSEC_API_MODE_FAIL_OPEN_MCP", "true").lower() == "true",
-        
-        # Gateway Mode Configuration (when integration_mode="gateway")
-        providers={
-            "bedrock": {
-                "gateway_url": os.getenv("AGENTSEC_BEDROCK_GATEWAY_URL"),
-                "gateway_api_key": os.getenv("AGENTSEC_BEDROCK_GATEWAY_API_KEY"),
-            },
-            "agentcore": {
-                "gateway_url": os.getenv("AGENTSEC_AGENTCORE_GATEWAY_URL"),
-                # No API key needed - AgentCore gateway uses AWS Sig V4 authentication
-            },
-        },
-        gateway_mode_mcp_url=os.getenv("AGENTSEC_MCP_GATEWAY_URL"),
-        gateway_mode_mcp_api_key=os.getenv("AGENTSEC_MCP_GATEWAY_API_KEY"),
-        gateway_mode_fail_open_llm=os.getenv("AGENTSEC_GATEWAY_MODE_FAIL_OPEN_LLM", "true").lower() == "true",
-        gateway_mode_fail_open_mcp=os.getenv("AGENTSEC_GATEWAY_MODE_FAIL_OPEN_MCP", "true").lower() == "true",
-        
+        config=_yaml_config,
         auto_dotenv=False,  # We already loaded .env manually
+        **_protect_kwargs,
     )
     
-    print(f"[agentsec] LLM: {os.getenv('AGENTSEC_API_MODE_LLM', 'on_monitor')} | "
-          f"Integration: {os.getenv('AGENTSEC_LLM_INTEGRATION_MODE', 'api')} | "
-          f"Patched: {agentsec.get_patched_clients()}")
+    print(f"[agentsec] Patched: {agentsec.get_patched_clients()}")
 
 
 # Configure agentsec on module import
@@ -125,7 +119,9 @@ def get_agent():
     if _agent is None:
         # Set default AWS region if not configured
         os.environ.setdefault("AWS_REGION", "us-west-2")
-        os.environ.setdefault("AWS_DEFAULT_REGION", "us-west-2")
+        # Ensure AWS_DEFAULT_REGION is consistent with AWS_REGION
+        # (boto3 checks AWS_DEFAULT_REGION first, so they must agree)
+        os.environ.setdefault("AWS_DEFAULT_REGION", os.environ["AWS_REGION"])
         
         # Get model ID from environment or use default
         model_id = os.getenv(

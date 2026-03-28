@@ -8,7 +8,7 @@ agentsec.protect() is called BEFORE importing the AI library to ensure
 all calls are properly intercepted and inspected by Cisco AI Defense.
 
 ARCHITECTURE:
-    User Prompt → LangChain Agent → ChatVertexAI (LLM)
+    User Prompt → LangChain Agent → Gemini LLM
                          ↓
                    Tool Calling
                          ↓
@@ -23,11 +23,21 @@ ARCHITECTURE:
                         ↓
                    Final Response
 
-SUPPORTED LIBRARIES:
-- `vertexai` (google-cloud-aiplatform) - via langchain-google-vertexai
-- `google-genai` (google-genai) - Modern unified SDK (set GOOGLE_AI_SDK=google_genai)
+SUPPORTED LIBRARIES (controlled by the ``sdk`` field on the vertexai gateway
+in agentsec.yaml, which resolves ``${GOOGLE_AI_SDK}`` from the environment):
 
-Set GOOGLE_AI_SDK=google_genai to use the modern SDK, otherwise defaults to vertexai.
+- google_genai (default for local development):
+  Uses ChatGoogleGenerativeAI (langchain-google-genai) with vertexai=True.
+  Internally uses google.genai.Client, patched by agentsec's google_genai patcher.
+  This is the forward path LangChain is steering toward.
+
+- vertexai (recommended for Agent Engine deployment):
+  Uses ChatVertexAI (langchain-google-vertexai) with vertexai.init().
+  Internally uses vertexai.GenerativeModel, patched by agentsec's vertexai patcher.
+  Avoids the ACCESS_TOKEN_SCOPE_INSUFFICIENT error in Agent Engine where the
+  managed SA lacks the generative-language scope that google.genai requires.
+
+Both paths are fully supported by agentsec for gateway and API mode inspection.
 """
 
 import os
@@ -45,64 +55,67 @@ _shared_env = Path(__file__).parent.parent.parent.parent / ".env"
 if _shared_env.exists():
     load_dotenv(_shared_env)
 
-# Determine which SDK to use
-GOOGLE_AI_SDK = os.getenv("GOOGLE_AI_SDK", "vertexai")  # "vertexai" or "google_genai"
+# =============================================================================
+# Configure agentsec protection (LAZY - initialized on first use)
+# =============================================================================
+# Resolve agentsec.yaml path (container vs local development)
+_yaml_paths = [
+    Path("/app/agentsec.yaml"),  # Container deployment
+    Path(__file__).parent.parent.parent.parent / "agentsec.yaml",  # examples/agentsec/agentsec.yaml
+]
+
+_yaml_config = None
+for _yp in _yaml_paths:
+    if _yp.exists():
+        _yaml_config = str(_yp)
+        break
+
+# Track if agentsec has been initialized
+_agentsec_initialized = False
+
+def _initialize_agentsec():
+    """
+    Initialize agentsec protection lazily via agentsec.yaml.
+    This is called on first use to avoid import-time dependencies.
+    
+    IMPORTANT: This lazy initialization is KEY for Agent Engine deployment.
+    It ensures agentsec.protect() is called AFTER requirements are installed
+    in the container, not at module import time during build validation.
+    
+    DO NOT revert to module-level agentsec.protect() call - it will break
+    Agent Engine deployments with "No module named 'wrapt'" errors.
+    
+    All gateway/API mode settings (URLs, keys, modes, fail-open, retry, etc.)
+    are defined in agentsec.yaml. Secrets are referenced via ${VAR_NAME} and
+    resolved from the environment (populated by load_dotenv above).
+    """
+    global _agentsec_initialized
+    if _agentsec_initialized:
+        return
+    
+    # Import here to defer dependency loading
+    from aidefense.runtime import agentsec
+    
+    # Allow integration test scripts to override YAML integration mode via env vars
+    _protect_kwargs = {}
+    if os.getenv("AGENTSEC_LLM_INTEGRATION_MODE"):
+        _protect_kwargs["llm_integration_mode"] = os.getenv("AGENTSEC_LLM_INTEGRATION_MODE")
+    if os.getenv("AGENTSEC_MCP_INTEGRATION_MODE"):
+        _protect_kwargs["mcp_integration_mode"] = os.getenv("AGENTSEC_MCP_INTEGRATION_MODE")
+
+    agentsec.protect(
+        config=_yaml_config,
+        auto_dotenv=False,  # We already loaded .env manually
+        **_protect_kwargs,
+    )
+    
+    print(f"[agentsec] Patched: {agentsec.get_patched_clients()}")
+    
+    _agentsec_initialized = True
 
 # =============================================================================
-# Configure agentsec protection (BEFORE importing any AI library)
+# Import LangChain libraries (AFTER agentsec is ready to be initialized)
 # =============================================================================
-from aidefense.runtime import agentsec
-
-# Build provider config based on which SDK we're using
-providers_config = {
-    "vertexai": {
-        "gateway_url": os.getenv("AGENTSEC_VERTEXAI_GATEWAY_URL"),
-        "gateway_api_key": os.getenv("AGENTSEC_VERTEXAI_GATEWAY_API_KEY"),
-    },
-    "google_genai": {
-        "gateway_url": os.getenv("AGENTSEC_GOOGLE_GENAI_GATEWAY_URL") or os.getenv("AGENTSEC_VERTEXAI_GATEWAY_URL"),
-        "gateway_api_key": os.getenv("AGENTSEC_GOOGLE_GENAI_GATEWAY_API_KEY") or os.getenv("AGENTSEC_VERTEXAI_GATEWAY_API_KEY"),
-    },
-}
-
-agentsec.protect(
-    # AI Defense integration mode: "api" or "gateway"
-    llm_integration_mode=os.getenv("AGENTSEC_LLM_INTEGRATION_MODE", "api"),
-    mcp_integration_mode=os.getenv("AGENTSEC_MCP_INTEGRATION_MODE", "api"),
-    
-    # API mode configuration (LLM)
-    api_mode_llm=os.getenv("AGENTSEC_API_MODE_LLM", "on_monitor"),
-    api_mode_llm_endpoint=os.getenv("AI_DEFENSE_API_MODE_LLM_ENDPOINT"),
-    api_mode_llm_api_key=os.getenv("AI_DEFENSE_API_MODE_LLM_API_KEY"),
-    api_mode_fail_open_llm=True,
-    
-    # API mode configuration (MCP)
-    api_mode_mcp=os.getenv("AGENTSEC_API_MODE_MCP", "on_monitor"),
-    api_mode_mcp_endpoint=os.getenv("AI_DEFENSE_API_MODE_MCP_ENDPOINT"),
-    api_mode_mcp_api_key=os.getenv("AI_DEFENSE_API_MODE_MCP_API_KEY"),
-    api_mode_fail_open_mcp=True,
-    
-    # Gateway mode configuration (LLM)
-    providers=providers_config,
-    
-    # Gateway mode configuration (MCP)
-    gateway_mode_mcp_url=os.getenv("AGENTSEC_MCP_GATEWAY_URL"),
-    gateway_mode_mcp_api_key=os.getenv("AGENTSEC_MCP_GATEWAY_API_KEY"),
-    gateway_mode_fail_open_mcp=True,
-    
-    # Disable auto .env loading since we did it manually
-    auto_dotenv=False,
-)
-
-print(f"[agentsec] SDK: {GOOGLE_AI_SDK} | LLM: {os.getenv('AGENTSEC_API_MODE_LLM', 'on_monitor')} | "
-      f"MCP: {os.getenv('AGENTSEC_API_MODE_MCP', 'on_monitor')} | "
-      f"Integration: LLM={os.getenv('AGENTSEC_LLM_INTEGRATION_MODE', 'api')}, MCP={os.getenv('AGENTSEC_MCP_INTEGRATION_MODE', 'api')} | "
-      f"Patched: {agentsec.get_patched_clients()}")
-
-# =============================================================================
-# Import LangChain libraries (AFTER agentsec.protect())
-# =============================================================================
-from langchain_google_vertexai import ChatVertexAI
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 
 # Import our tools
@@ -114,21 +127,7 @@ from .mcp_tools import get_mcp_tools
 # =============================================================================
 
 # System prompt for the SRE agent
-SYSTEM_PROMPT = """You are an SRE (Site Reliability Engineering) helper agent.
-
-You have access to the following capabilities:
-- Check service health status (check_service_health)
-- Get recent log entries (get_recent_logs)
-- Calculate capacity planning metrics (calculate_capacity)
-- Fetch webpage content from URLs (fetch_url) - Use this when asked to fetch or read a URL
-
-When asked to check a service, USE the check_service_health tool.
-When asked to view logs, USE the get_recent_logs tool.
-When asked about capacity or scaling, USE the calculate_capacity tool.
-When asked to fetch a URL or read webpage content, ALWAYS use the fetch_url tool.
-
-Be helpful, concise, and technically accurate.
-After using a tool, summarize the results clearly for the user."""
+SYSTEM_PROMPT = """You are an SRE helper agent. Use check_service_health for service checks, get_recent_logs for logs, calculate_capacity for scaling, and fetch_url for URLs. Be concise and accurate. Summarize tool results for the user."""
 
 # Global agent state (singleton pattern for cold start optimization)
 _llm_with_tools = None
@@ -153,17 +152,47 @@ def _get_agent():
         location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
         model_name = os.getenv("VERTEX_AI_MODEL", "gemini-2.0-flash-001")
         
+        # Resolve SDK from the agentsec gateway config (set via agentsec.yaml's
+        # sdk: ${GOOGLE_AI_SDK}), falling back to the GOOGLE_AI_SDK env var.
+        from aidefense.runtime.agentsec._state import get_default_gateway_for_provider
+        _gw = get_default_gateway_for_provider("vertexai")
+        google_ai_sdk = (_gw.get("sdk") if _gw else None) or os.getenv("GOOGLE_AI_SDK", "google_genai")
+        
         print(f"[agent] Creating LangChain agent with model: {model_name}", flush=True)
         print(f"[agent] Project: {project}, Location: {location}", flush=True)
+        print(f"[agent] SDK path: {google_ai_sdk}", flush=True)
         
-        # Create the LLM
-        llm = ChatVertexAI(
-            model=model_name,
-            project=project,
-            location=location,
-            temperature=0.7,
-            max_output_tokens=1024,
-        )
+        if google_ai_sdk == "vertexai":
+            # Agent Engine safe path: uses vertexai.GenerativeModel internally,
+            # which only requires the aiplatform scope (always available in
+            # Agent Engine). Patched by agentsec's vertexai patcher.
+            import vertexai
+            from langchain_google_vertexai import ChatVertexAI
+            
+            vertexai.init(project=project, location=location)
+            llm = ChatVertexAI(
+                model_name=model_name,
+                temperature=0.7,
+                max_output_tokens=1024,
+            )
+        else:
+            # Modern forward path (default): uses google.genai.Client internally.
+            # Patched by agentsec's google_genai patcher.
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            import google.auth
+            
+            _credentials, _ = google.auth.default(
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            )
+            llm = ChatGoogleGenerativeAI(
+                model=model_name,
+                vertexai=True,
+                project=project,
+                location=location,
+                credentials=_credentials,
+                temperature=0.7,
+                max_output_tokens=1024,
+            )
         
         # Combine local tools + MCP tools (if configured)
         local_tools = TOOLS  # [check_service_health, get_recent_logs, calculate_capacity]
@@ -269,6 +298,9 @@ def invoke_agent(prompt: str, model: str = None) -> str:
     """
     global _nest_asyncio_applied
     
+    # Initialize agentsec protection (lazy, only on first call)
+    _initialize_agentsec()
+    
     # Enable nested event loops (required for sync tool calling async MCP)
     # Applied on first invocation to avoid side effects when module is imported
     if not _nest_asyncio_applied:
@@ -295,5 +327,8 @@ def invoke_agent(prompt: str, model: str = None) -> str:
 
 def get_client():
     """Get the initialized LangChain LLM (for compatibility)."""
+    # Initialize agentsec protection (lazy, only on first call)
+    _initialize_agentsec()
+    
     llm_with_tools, _ = _get_agent()
     return llm_with_tools

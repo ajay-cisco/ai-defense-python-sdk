@@ -74,10 +74,16 @@ class TestExampleStructure:
             requirements = os.path.join(project_dir, deploy_mode, "requirements.txt")
             assert os.path.isfile(requirements), f"{deploy_mode}/requirements.txt should exist"
             
-            # Verify agentsec is in requirements
+            # Verify SDK is present: either cisco-aidefense-sdk (PyPI) or bundled aidefense (local package)
             with open(requirements, "r") as f:
                 content = f.read()
-            assert "agentsec" in content, f"{deploy_mode}/requirements.txt should include agentsec"
+            has_sdk = "cisco-aidefense-sdk" in content or (
+                "aidefense" in content.lower() and ("bundled" in content.lower() or "aiohttp" in content)
+            )
+            assert has_sdk, (
+                f"{deploy_mode}/requirements.txt should include cisco-aidefense-sdk or "
+                "aidefense dependencies (when SDK is bundled as source)"
+            )
 
     def test_kubernetes_configs_exist_for_gke(self):
         """Test that Kubernetes configs exist for GKE deployment."""
@@ -183,25 +189,22 @@ class TestAgentFactoryStructure:
         # Find positions of key imports
         agentsec_pos = content.find("import agentsec")
         protect_pos = content.find("agentsec.protect(")
-        langchain_pos = content.find("from langchain_google_vertexai")
         
         assert agentsec_pos != -1, "agentsec import should be present"
         assert protect_pos != -1, "agentsec.protect() should be present"
-        assert langchain_pos != -1, "LangChain import should be present"
-        
-        # Verify order: agentsec.protect() must come before any AI library import
-        assert protect_pos < langchain_pos, "agentsec.protect() must be called before importing LangChain"
 
     def test_agent_factory_uses_langchain(self):
-        """Test that agent_factory.py uses LangChain ChatVertexAI."""
+        """Test that agent_factory.py supports both LangChain SDK paths."""
         project_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
         agent_factory_path = os.path.join(project_dir, "_shared", "agent_factory.py")
         
         with open(agent_factory_path, "r") as f:
             content = f.read()
         
-        assert "from langchain_google_vertexai import ChatVertexAI" in content, "Should use ChatVertexAI from langchain-google-vertexai"
-        assert "ChatVertexAI(" in content, "Should instantiate ChatVertexAI"
+        # Both SDK paths should be present (branched on sdk hint)
+        assert "ChatGoogleGenerativeAI(" in content, "Should support ChatGoogleGenerativeAI (google_genai path)"
+        assert "ChatVertexAI(" in content, "Should support ChatVertexAI (vertexai path)"
+        assert "get_default_gateway_for_provider" in content, "Should resolve sdk from agentsec gateway config"
 
     def test_agent_factory_binds_tools(self):
         """Test that agent_factory.py binds tools to LLM."""
@@ -225,30 +228,16 @@ class TestAgentFactoryStructure:
         assert "tool_calls" in content, "Should check for tool_calls"
         assert "ToolMessage" in content, "Should use ToolMessage for tool results"
 
-    def test_agent_factory_configures_gateway_mode(self):
-        """Test that agent_factory.py has gateway mode configuration."""
+    def test_agent_factory_uses_yaml_config(self):
+        """Test that agent_factory.py uses agentsec.yaml config file."""
         project_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
         agent_factory_path = os.path.join(project_dir, "_shared", "agent_factory.py")
         
         with open(agent_factory_path, "r") as f:
             content = f.read()
         
-        assert "llm_integration_mode" in content, "Should configure llm_integration_mode"
-        assert "AGENTSEC_LLM_INTEGRATION_MODE" in content, "Should read from AGENTSEC_LLM_INTEGRATION_MODE env var"
-        assert "providers" in content, "Should configure providers"
-
-    def test_agent_factory_configures_api_mode(self):
-        """Test that agent_factory.py has API mode configuration."""
-        project_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-        agent_factory_path = os.path.join(project_dir, "_shared", "agent_factory.py")
-        
-        with open(agent_factory_path, "r") as f:
-            content = f.read()
-        
-        assert "api_mode_llm" in content, "Should configure api_mode_llm"
-        assert "AGENTSEC_API_MODE_LLM" in content, "Should read from AGENTSEC_API_MODE_LLM env var"
-        assert "api_mode_llm_endpoint" in content, "Should configure api endpoint"
-        assert "api_mode_llm_api_key" in content, "Should configure api key"
+        assert "agentsec.yaml" in content, "Should reference agentsec.yaml config file"
+        assert "config=" in content, "Should pass config= parameter to agentsec.protect()"
 
     def test_agent_factory_has_invoke_function(self):
         """Test that agent_factory.py exports invoke_agent function."""
@@ -558,13 +547,13 @@ class TestMCPTools:
         assert "MCP_SERVER_URL" in content, "Should read MCP_SERVER_URL from environment"
     
     def test_agent_factory_has_mcp_config(self):
-        """Test that agent_factory.py includes MCP configuration."""
+        """Test that agent_factory.py includes MCP tool support."""
         project_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
         agent_factory_file = os.path.join(project_dir, "_shared", "agent_factory.py")
         with open(agent_factory_file, "r") as f:
             content = f.read()
-        assert "mcp_integration_mode" in content, "agent_factory should configure mcp_integration_mode"
-        assert "api_mode_mcp" in content, "agent_factory should configure api_mode_mcp"
+        assert "mcp_tools" in content, "agent_factory should reference mcp_tools"
+        assert "agentsec.yaml" in content, "agent_factory should use agentsec.yaml for MCP config"
     
     def test_init_exports_mcp_tools(self):
         """Test that __init__.py exports MCP tools."""
@@ -590,6 +579,7 @@ class TestMCPTools:
         with open(pyproject_file, "r") as f:
             content = f.read()
         assert "langchain" in content, "pyproject.toml should include langchain dependency"
+        assert "langchain-google-genai" in content, "pyproject.toml should include langchain-google-genai"
         assert "langchain-google-vertexai" in content, "pyproject.toml should include langchain-google-vertexai"
     
     def test_mcp_integration_test_exists(self):

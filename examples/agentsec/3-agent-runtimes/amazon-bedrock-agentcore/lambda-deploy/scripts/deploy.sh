@@ -25,8 +25,9 @@ ROOT_DIR="$(cd "$DEPLOY_DIR/.." && pwd)"
 
 cd "$ROOT_DIR"
 
-# Load environment variables from shared examples/.env
-EXAMPLES_DIR="$(cd "$ROOT_DIR/.." && pwd)"
+# Load environment variables from shared examples/.env (preserve name if set by parent e.g. --new-resources)
+_SAVED_FUNCTION_NAME="${FUNCTION_NAME:-}"
+EXAMPLES_DIR="$(cd "$ROOT_DIR/../.." && pwd)"
 if [ -f "$EXAMPLES_DIR/.env" ]; then
     set -a
     source "$EXAMPLES_DIR/.env"
@@ -36,6 +37,7 @@ elif [ -f "$ROOT_DIR/.env" ]; then
     source "$ROOT_DIR/.env"
     set +a
 fi
+[ -n "$_SAVED_FUNCTION_NAME" ] && export FUNCTION_NAME="$_SAVED_FUNCTION_NAME"
 
 # Set defaults
 export AWS_REGION="${AWS_REGION:-us-west-2}"
@@ -93,6 +95,14 @@ if [ -f "$EXAMPLES_DIR/.env" ]; then
     cp "$EXAMPLES_DIR/.env" build/lambda/
 elif [ -f "$ROOT_DIR/.env" ]; then
     cp "$ROOT_DIR/.env" build/lambda/
+fi
+
+# Copy agentsec.yaml (required for agentsec configuration in Lambda)
+if [ -f "$EXAMPLES_DIR/agentsec.yaml" ]; then
+    cp "$EXAMPLES_DIR/agentsec.yaml" build/lambda/
+    echo "Copied agentsec.yaml from $EXAMPLES_DIR"
+else
+    echo "WARNING: agentsec.yaml not found at $EXAMPLES_DIR - Lambda will run without agentsec config"
 fi
 
 # Create deployment package

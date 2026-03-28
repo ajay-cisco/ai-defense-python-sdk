@@ -19,15 +19,23 @@ Usage:
 """
 
 import asyncio
+import logging
 import os
 import sys
 import time
 import threading
 from pathlib import Path
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+# Configurable timeout from environment
+MCP_TIMEOUT = int(os.getenv("MCP_TIMEOUT", "60"))
+
 # Load shared .env file (before agentsec.protect())
 from dotenv import load_dotenv
-shared_env = Path(__file__).parent.parent / "_shared" / ".env"
+shared_env = Path(__file__).parent.parent.parent / ".env"
 if shared_env.exists():
     load_dotenv(shared_env)
 
@@ -35,25 +43,28 @@ if shared_env.exists():
 # MINIMAL agentsec integration: Just 2 lines!
 # =============================================================================
 from aidefense.runtime import agentsec
-agentsec.protect()  # Reads config from .env, patches clients
+config_path = str(Path(__file__).parent.parent.parent / "agentsec.yaml")
+# Allow integration test script to override YAML integration mode via env vars
+_protect_kwargs = {}
+if os.getenv("AGENTSEC_LLM_INTEGRATION_MODE"):
+    _protect_kwargs["llm_integration_mode"] = os.getenv("AGENTSEC_LLM_INTEGRATION_MODE")
+if os.getenv("AGENTSEC_MCP_INTEGRATION_MODE"):
+    _protect_kwargs["mcp_integration_mode"] = os.getenv("AGENTSEC_MCP_INTEGRATION_MODE")
+agentsec.protect(config=config_path, **_protect_kwargs)
 
 # That's it! Now import your frameworks normally
 #
-# Alternative: Configure Gateway mode programmatically (provider-specific):
-#   agentsec.protect(
-#       llm_integration_mode="gateway",
-#       providers={"openai": {"gateway_url": "https://gateway.../conn", "gateway_api_key": "key"}},
-#       auto_dotenv=False,
-#   )
-from agentsec.exceptions import SecurityPolicyError
+# Alternative: Configure inline (for quick testing):
+#   agentsec.protect(api_mode={"llm": {"mode": "monitor"}})
+from aidefense.runtime.agentsec.exceptions import SecurityPolicyError
 
-print(f"[agentsec] LLM: {os.getenv('AGENTSEC_API_MODE_LLM', 'monitor')} | Integration: {os.getenv('AGENTSEC_LLM_INTEGRATION_MODE', 'api')} | Patched: {agentsec.get_patched_clients()}")
+print(f"[agentsec] Patched: {agentsec.get_patched_clients()}")
 
 # =============================================================================
 # Import shared provider infrastructure
 # =============================================================================
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from _shared import load_config, create_provider
+from _shared import load_config, create_provider, validate_url, URLValidationError
 
 # =============================================================================
 # Import agent libraries (AFTER agentsec.protect())
@@ -84,11 +95,11 @@ def _sync_call_mcp_tool(tool_name: str, arguments: dict, max_retries: int = 3) -
     
     def run_in_thread():
         async def _async_call():
-            async with streamablehttp_client(_mcp_url, timeout=120) as (read, write, _):
+            async with streamablehttp_client(_mcp_url, timeout=MCP_TIMEOUT) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     result = await session.call_tool(tool_name, arguments)
-                    return result.content[0].text if result.content else "No answer"
+                    return next((c.text for c in (result.content or []) if hasattr(c, "text")), "No answer")
         
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -105,7 +116,7 @@ def _sync_call_mcp_tool(tool_name: str, arguments: dict, max_retries: int = 3) -
         
         thread = threading.Thread(target=run_in_thread)
         thread.start()
-        thread.join(timeout=120)
+        thread.join(timeout=MCP_TIMEOUT)
         
         if result_container["result"] is not None:
             return result_container["result"]
@@ -141,30 +152,36 @@ def fetch_url(url: str) -> str:
         The text content of the URL
     """
     global _mcp_url
-    print(f"[DEBUG] fetch_url called: url={url}", flush=True)
+    logger.info(f"fetch_url called: url={url}")
+    
+    # Validate URL to prevent SSRF attacks
+    try:
+        validate_url(url)
+    except URLValidationError as e:
+        logger.warning(f"URL validation failed: {e}")
+        return f"Error: Invalid URL - {e}"
+    
     if _mcp_url is None:
-        print("[DEBUG] MCP URL not set!", flush=True)
+        logger.warning("MCP URL not set")
         return "Error: MCP not configured"
     
     try:
-        print(f"[TOOL CALL] fetch_url(url='{url}')", flush=True)
+        logger.info(f"Calling fetch tool for '{url}'")
         start = time.time()
         
         response_text = _sync_call_mcp_tool('fetch', {'url': url})
         
         elapsed = time.time() - start
-        print(f"[TOOL] Got response ({len(response_text)} chars) in {elapsed:.1f}s", flush=True)
+        logger.info(f"Got response ({len(response_text)} chars) in {elapsed:.1f}s")
         return response_text
     except Exception as e:
         error_name = type(e).__name__
         error_msg = str(e)
         # Only log brief info for connection errors (don't print full traceback)
         if 'ConnectError' in error_name or 'ExceptionGroup' in error_name or 'TimeoutError' in error_name:
-            print(f"[TOOL] MCP connection failed after retries: {error_name}", flush=True)
+            logger.warning(f"MCP connection failed after retries: {error_name}")
         else:
-            print(f"[TOOL] Unexpected error: {error_name}: {error_msg}", flush=True)
-            import traceback
-            traceback.print_exc()
+            logger.exception(f"Unexpected error: {error_name}: {error_msg}")
         return f"Error fetching URL: {error_name}"
 
 
@@ -184,13 +201,13 @@ def create_llm_from_provider():
         raise ValueError("Provider not initialized. Call setup first.")
     
     llm = _provider.get_crewai_llm()
-    print(f"[DEBUG] Created LLM from provider: {_provider.model_id}", flush=True)
+    logger.debug(f"Created LLM from provider: {_provider.model_id}")
     return llm
 
 
 def create_crew(model_id: str):
     """Create the Researcher + Writer crew."""
-    print(f"[DEBUG] Creating crew with model: {model_id}", flush=True)
+    logger.debug(f"Creating crew with model: {model_id}")
     
     # Create the LLM instance from provider
     llm = create_llm_from_provider()
@@ -206,7 +223,7 @@ def create_crew(model_id: str):
         tools=[],  # Tool will be used via task description
         llm=llm,
     )
-    print("[DEBUG] Researcher agent created", flush=True)
+    logger.debug("Researcher agent created")
     
     # Writer agent - summarizes research findings
     writer = Agent(
@@ -219,7 +236,7 @@ def create_crew(model_id: str):
         allow_delegation=False,
         llm=llm,
     )
-    print("[DEBUG] Writer agent created", flush=True)
+    logger.debug("Writer agent created")
     
     return researcher, writer
 
@@ -230,17 +247,20 @@ def create_tasks(researcher, writer):
     Uses CrewAI's input interpolation ({question}) so tasks can be reused
     with different inputs via crew.kickoff(inputs={"question": ...}).
     """
-    print("[DEBUG] Creating reusable tasks with input placeholders", flush=True)
+    logger.debug("Creating reusable tasks with input placeholders")
     
-    # Research task - uses {question} placeholder for input interpolation
+    # Research task - uses {question} and {fetched_content} placeholders for input interpolation
     research_task = Task(
-        description="""Analyze the following question and any fetched URL content:
-        
-        Question: {question}
-        
-        Provide accurate technical information based on the fetched content.
-        Focus on extracting specific details that answer the question.""",
-        expected_output="Detailed technical information answering the question",
+        description="""Analyze the following question and the fetched URL content provided below.
+
+Question: {question}
+
+Fetched URL Content:
+{fetched_content}
+
+Based on the fetched content above, provide accurate technical information that answers the question.
+Focus on extracting specific details from the actual content.""",
+        expected_output="Detailed technical information answering the question based on the fetched content",
         agent=researcher,
     )
     
@@ -281,17 +301,17 @@ async def setup_mcp():
     _mcp_url = mcp_url
     
     if not mcp_url:
-        print("[DEBUG] MCP_SERVER_URL not set, MCP tools disabled", flush=True)
+        logger.debug("MCP_SERVER_URL not set, MCP tools disabled")
         return
     
-    print(f"[mcp] MCP URL configured: {mcp_url}", flush=True)
+    logger.info(f"MCP URL configured: {mcp_url}")
 
 
 async def run_crew(initial_message: str = None):
     """Run the CrewAI crew."""
     global _provider
     
-    print("[DEBUG] run_crew started", flush=True)
+    logger.debug("run_crew started")
     
     # Load configuration and create provider
     try:
@@ -313,7 +333,7 @@ async def run_crew(initial_message: str = None):
     
     # Get model ID from provider
     model_id = _provider.model_id
-    print(f"[agent] Using model: {model_id}", flush=True)
+    logger.info(f"Using model: {model_id}")
     
     # Create agents
     researcher, writer = create_crew(model_id)
@@ -322,7 +342,7 @@ async def run_crew(initial_message: str = None):
     tasks = create_tasks(researcher, writer)
     
     # Create crew once (reused for all questions via input interpolation)
-    print("[DEBUG] Creating reusable crew...", flush=True)
+    logger.debug("Creating reusable crew")
     crew = Crew(
         agents=[researcher, writer],
         tasks=tasks,
@@ -340,18 +360,21 @@ async def run_crew(initial_message: str = None):
         try:
             # First, fetch URL content if MCP is configured
             if _mcp_url:
-                print(f"\n[DEBUG] Fetching URL content via MCP...", flush=True)
+                logger.debug("Fetching URL content via MCP")
                 research = do_mcp_research(initial_message)
-                print(f"[DEBUG] Content retrieved: {len(research)} chars", flush=True)
+                logger.debug(f"Content retrieved: {len(research)} chars")
             else:
                 research = "No MCP connection available."
             
-            # Run crew with question input (reuses crew instance)
-            print("[DEBUG] Running crew...", flush=True)
+            # Run crew with question and fetched content as inputs
+            logger.debug("Running crew")
             start = time.time()
-            result = crew.kickoff(inputs={"question": initial_message})
+            result = crew.kickoff(inputs={
+                "question": initial_message,
+                "fetched_content": research,
+            })
             elapsed = time.time() - start
-            print(f"[DEBUG] Crew completed in {elapsed:.1f}s", flush=True)
+            logger.debug(f"Crew completed in {elapsed:.1f}s")
             
             print(f"\n{'='*60}", flush=True)
             print("Final Answer:", flush=True)
@@ -383,9 +406,14 @@ async def run_crew(initial_message: str = None):
                 # Get research first
                 if _mcp_url:
                     research = do_mcp_research(user_input)
+                else:
+                    research = "No MCP connection available."
                 
-                # Run crew with question input (reuses crew instance)
-                result = crew.kickoff(inputs={"question": user_input})
+                # Run crew with question and fetched content
+                result = crew.kickoff(inputs={
+                    "question": user_input,
+                    "fetched_content": research,
+                })
                 print(f"\nAnswer: {result}\n", flush=True)
                 
             except SecurityPolicyError as e:
@@ -398,7 +426,7 @@ async def run_crew(initial_message: str = None):
 
 def main():
     """Entry point."""
-    print("[DEBUG] main() started", flush=True)
+    logger.debug("main() started")
     import warnings
     warnings.filterwarnings("ignore", category=RuntimeWarning)
     
@@ -412,18 +440,18 @@ def main():
     
     # Get initial message from command line if provided
     initial_message = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else None
-    print(f"[DEBUG] Initial message: {initial_message}", flush=True)
+    logger.debug(f"Initial message: {initial_message}")
     
     loop = asyncio.new_event_loop()
     loop.set_exception_handler(exception_handler)
     try:
-        print("[DEBUG] Starting event loop...", flush=True)
+        logger.debug("Starting event loop")
         loop.run_until_complete(run_crew(initial_message))
     finally:
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Error during async generator shutdown: {e}")
         loop.close()
 
 

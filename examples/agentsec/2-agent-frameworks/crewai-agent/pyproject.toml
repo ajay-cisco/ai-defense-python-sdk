@@ -13,7 +13,8 @@ python = ">=3.10,<3.14"
 cisco-aidefense-sdk = { path = "../../../..", develop = true }
 
 # CrewAI framework with native provider integrations
-crewai = { version = ">=0.28.0", extras = ["azure-ai-inference"] }
+# litellm extra is required for Vertex AI support
+crewai = { version = ">=0.28.0", extras = ["azure-ai-inference", "litellm"] }
 
 # AWS SDK for Bedrock
 boto3 = ">=1.28.0"

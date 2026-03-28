@@ -31,7 +31,7 @@ amazon-bedrock-agentcore/
 ├── README.md                 # This file
 ├── _shared/                  # Shared code across all deploy modes
 │   ├── __init__.py
-│   ├── agent_factory.py      # Agent creation with explicit agentsec config
+│   ├── agent_factory.py      # Agent creation with agentsec.yaml config
 │   └── tools.py              # Demo tools (add, check_service_health, summarize_log)
 ├── direct-deploy/            # Direct code deployment
 │   ├── agentcore_app.py
@@ -148,65 +148,31 @@ vim examples/.env
 
 ## agentsec Configuration
 
-The `agentsec.protect()` call is configured in `_shared/agent_factory.py` with explicit URLs for both LLM and MCP:
+The `agentsec.protect()` call in `_shared/agent_factory.py` loads all configuration from the shared `agentsec.yaml` file:
 
 ```python
-import agentsec
+from aidefense.runtime import agentsec
 
 agentsec.protect(
-    # Integration mode: "api" (inspection) or "gateway" (proxy)
-    llm_integration_mode=os.getenv("AGENTSEC_LLM_INTEGRATION_MODE", "api"),
-    mcp_integration_mode=os.getenv("AGENTSEC_MCP_INTEGRATION_MODE", "api"),
-    
-    # API Mode Configuration
-    api_mode_llm=os.getenv("AGENTSEC_API_MODE_LLM", "on_monitor"),
-    api_mode_llm_endpoint=os.getenv("AI_DEFENSE_API_MODE_LLM_ENDPOINT"),
-    api_mode_llm_api_key=os.getenv("AI_DEFENSE_API_MODE_LLM_API_KEY"),
-    
-    # Gateway Mode Configuration
-    providers={
-        "bedrock": {
-            "gateway_url": os.getenv("AGENTSEC_BEDROCK_GATEWAY_URL"),
-            "gateway_api_key": os.getenv("AGENTSEC_BEDROCK_GATEWAY_API_KEY"),
-        },
-        "agentcore": {
-            "gateway_url": os.getenv("AGENTSEC_AGENTCORE_GATEWAY_URL"),
-            # No API key - uses AWS Sig V4 authentication
-        },
-    },
-    
-    auto_dotenv=False,  # We load .env manually
+    config=str(_yaml_config),  # path to agentsec.yaml
+    auto_dotenv=False,         # .env already loaded manually
 )
 ```
 
+All gateway URLs, API mode settings, retry policies, and fail-open defaults are defined in `agentsec.yaml`. Secrets are referenced via `${VAR_NAME}` and resolved from environment variables (populated by `.env`).
+
+See `examples/agentsec/agentsec.yaml` for the full configuration reference.
+
 ## Environment Variables Reference
 
-All environment variables are loaded from the shared `examples/.env` file.
+All environment variables are loaded from the shared `examples/.env` file. Agentsec-specific settings (gateway URLs, integration modes, etc.) are defined in `agentsec.yaml` rather than as individual env vars.
 
-### agentsec Configuration
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `AGENTSEC_LLM_INTEGRATION_MODE` | Integration mode: `api` or `gateway` | `api` |
-| `AGENTSEC_MCP_INTEGRATION_MODE` | MCP integration mode: `api` or `gateway` | `api` |
-
-#### API Mode Variables (when `AGENTSEC_LLM_INTEGRATION_MODE=api`)
+### Secrets (referenced by agentsec.yaml via `${VAR_NAME}`)
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `AI_DEFENSE_API_MODE_LLM_ENDPOINT` | AI Defense API endpoint | Yes |
-| `AI_DEFENSE_API_MODE_LLM_API_KEY` | AI Defense API key | Yes |
-| `AGENTSEC_API_MODE_LLM` | Mode: `off`, `on_monitor`, `on_enforce` | No (default: `on_monitor`) |
-| `AGENTSEC_API_MODE_FAIL_OPEN_LLM` | Allow requests if API unavailable | No (default: `true`) |
-
-#### Gateway Mode Variables (when `AGENTSEC_LLM_INTEGRATION_MODE=gateway`)
-
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `AGENTSEC_BEDROCK_GATEWAY_URL` | AI Defense Gateway URL for Bedrock | Yes |
-| `AGENTSEC_BEDROCK_GATEWAY_API_KEY` | Gateway API key for Bedrock | Yes |
-| `AGENTSEC_AGENTCORE_GATEWAY_URL` | AI Defense Gateway URL for AgentCore | Yes |
-| `AGENTSEC_MCP_GATEWAY_URL` | AI Defense Gateway URL for MCP | No |
+| `AI_DEFENSE_API_MODE_LLM_API_KEY` | AI Defense API key for LLM inspection | Yes (API mode) |
+| `AI_DEFENSE_API_MODE_MCP_API_KEY` | AI Defense API key for MCP inspection | Yes (API mode) |
 
 ### AWS Configuration
 
@@ -423,5 +389,13 @@ Tests cover:
 - Payload parsing (Bedrock Converse format, simple prompts, query, input, text)
 - Response parsing (result, response, completion, content, StreamingBody)
 - Gateway mode with AWS Sig V4 authentication
+
+> **Per-gateway AWS credentials**: In `agentsec.yaml`, each Bedrock gateway
+> (e.g. `bedrock-1`, `bedrock-2`) can specify its own `aws_region`,
+> `aws_profile`, or explicit keys (`aws_access_key_id`, `aws_secret_access_key`,
+> `aws_session_token`) for SigV4 signing. This allows routing different calls
+> through different AWS accounts or regions. Cross-account access is supported
+> via `aws_role_arn`. See `examples/agentsec/agentsec.yaml` for configuration
+> examples.
 - API mode inspection and enforcement
 - State configuration

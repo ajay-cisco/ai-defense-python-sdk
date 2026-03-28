@@ -17,6 +17,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SIMPLE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PROJECT_DIR="$(cd "$SIMPLE_DIR/../../.." && pwd)"
 
+# Colors for output (defined early so error messages can use them)
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+NC='\033[0m' # No Color
+
 # Check poetry is available
 if ! command -v poetry &> /dev/null; then
     echo -e "${RED}ERROR: Poetry is not installed${NC}"
@@ -24,12 +33,14 @@ if ! command -v poetry &> /dev/null; then
     exit 1
 fi
 
+# Track overall start time (includes setup and all tests)
+TOTAL_START_TIME=$(date +%s)
+
 # Ensure poetry dependencies are installed
-if [ ! -f "$SIMPLE_DIR/poetry.lock" ]; then
-    echo "Running 'poetry install' first..."
-    cd "$SIMPLE_DIR"
-    poetry install
-fi
+# Always run poetry install to ensure virtualenv exists with all dependencies
+echo "Ensuring dependencies are installed..."
+cd "$SIMPLE_DIR"
+poetry install --quiet 2>/dev/null || poetry install
 
 # Load shared environment variables from project .env
 if [ -f "$PROJECT_DIR/examples/agentsec/.env" ]; then
@@ -40,28 +51,25 @@ fi
 
 # Parse arguments
 VERBOSE=false
-for arg in "$@"; do
-    case $arg in
+while [[ $# -gt 0 ]]; do
+    case $1 in
         -v|--verbose)
             VERBOSE=true
+            shift
+            ;;
+        *)
             shift
             ;;
     esac
 done
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
-NC='\033[0m' # No Color
-
 # Track results
 PASSED=0
 FAILED=0
 FAILED_TESTS=""
+
+# Timing tracking (using regular array with key:value format for bash 3 compatibility)
+EXAMPLE_TIMES=()
 
 echo "=============================================="
 echo "  Simple Examples Integration Tests"
@@ -93,7 +101,8 @@ run_test_with_mode() {
     local log_file=$(mktemp)
     
     # Run and capture output
-    output=$(cd "$PROJECT_DIR" && \
+    # Run from SIMPLE_DIR to use the correct virtualenv with all dependencies
+    output=$(cd "$SIMPLE_DIR" && \
         AGENTSEC_LLM_INTEGRATION_MODE="$llm_mode" \
         AGENTSEC_MCP_INTEGRATION_MODE="$mcp_mode" \
         AGENTSEC_LOG_LEVEL="DEBUG" \
@@ -217,7 +226,7 @@ verify_protection_with_mode() {
     echo -e "${CYAN}  Verifying protection mode...${NC}"
     
     local output
-    output=$(cd "$PROJECT_DIR" && \
+    output=$(cd "$SIMPLE_DIR" && \
         AGENTSEC_LLM_INTEGRATION_MODE="$llm_mode" \
         AGENTSEC_MCP_INTEGRATION_MODE="$mcp_mode" \
         AGENTSEC_LOG_LEVEL="DEBUG" \
@@ -246,6 +255,8 @@ run_example_tests() {
     local name="$1"
     local script="$2"
     
+    local example_start=$(date +%s)
+    
     echo "=============================================="
     echo -e "  ${CYAN}$name${NC}"
     echo "=============================================="
@@ -260,6 +271,9 @@ run_example_tests() {
     run_test_with_mode "$name" "$script" "gateway" "gateway"
     verify_protection_with_mode "$name" "$script" "gateway" "gateway"
     echo ""
+    
+    local example_end=$(date +%s)
+    EXAMPLE_TIMES+=("$name:$((example_end - example_start))")
 }
 
 echo ""
@@ -269,13 +283,24 @@ echo "=============================================="
 echo ""
 
 # Test each example in both modes
-run_example_tests "basic_protection.py" "examples/agentsec/1-simple/basic_protection.py"
-run_example_tests "openai_example.py" "examples/agentsec/1-simple/openai_example.py"
-run_example_tests "streaming_example.py" "examples/agentsec/1-simple/streaming_example.py"
-run_example_tests "mcp_example.py" "examples/agentsec/1-simple/mcp_example.py"
-run_example_tests "gateway_mode_example.py" "examples/agentsec/1-simple/gateway_mode_example.py"
-run_example_tests "skip_inspection_example.py" "examples/agentsec/1-simple/skip_inspection_example.py"
-run_example_tests "simple_strands_bedrock.py" "examples/agentsec/1-simple/simple_strands_bedrock.py"
+# Script paths are relative to SIMPLE_DIR since we run from there
+run_example_tests "basic_protection.py" "basic_protection.py"
+run_example_tests "openai_example.py" "openai_example.py"
+run_example_tests "cohere_example.py" "cohere_example.py"
+run_example_tests "mistral_example.py" "mistral_example.py"
+run_example_tests "streaming_example.py" "streaming_example.py"
+run_example_tests "mcp_example.py" "mcp_example.py"
+run_example_tests "gateway_mode_example.py" "gateway_mode_example.py"
+run_example_tests "skip_inspection_example.py" "skip_inspection_example.py"
+run_example_tests "simple_strands_bedrock.py" "simple_strands_bedrock.py"
+run_example_tests "multi_gateway_example.py" "multi_gateway_example.py"
+run_example_tests "custom_rules_example.py" "custom_rules_example.py"
+
+# Calculate total time
+TOTAL_END_TIME=$(date +%s)
+TOTAL_DURATION=$((TOTAL_END_TIME - TOTAL_START_TIME))
+TOTAL_DURATION_MIN=$((TOTAL_DURATION / 60))
+TOTAL_DURATION_SEC=$((TOTAL_DURATION % 60))
 
 echo "=============================================="
 echo "  Test Results Summary"
@@ -284,15 +309,31 @@ echo ""
 echo -e "Total Tests: $((PASSED + FAILED))"
 echo -e "Passed: ${GREEN}$PASSED${NC}"
 echo -e "Failed: ${RED}$FAILED${NC}"
+echo ""
+
+# Timing breakdown
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${CYAN}  Timing Breakdown:${NC}"
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+for time_entry in "${EXAMPLE_TIMES[@]}"; do
+    example_name="${time_entry%%:*}"
+    example_secs="${time_entry##*:}"
+    example_min=$((example_secs / 60))
+    example_sec=$((example_secs % 60))
+    printf "  %-30s %dm %ds\n" "$example_name:" "$example_min" "$example_sec"
+done
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "  Total Runtime:                ${TOTAL_DURATION_MIN}m ${TOTAL_DURATION_SEC}s"
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
 
 if [ $FAILED -gt 0 ]; then
     echo -e "\nFailed tests:${FAILED_TESTS}"
     echo ""
-    echo -e "${RED}Some tests failed!${NC}"
+    echo -e "${RED}Some tests failed in ${TOTAL_DURATION_MIN}m ${TOTAL_DURATION_SEC}s!${NC}"
     exit 1
 else
-    echo ""
-    echo -e "${GREEN}ALL TESTS PASSED!${NC}"
+    echo -e "${GREEN}ALL TESTS PASSED in ${TOTAL_DURATION_MIN}m ${TOTAL_DURATION_SEC}s!${NC}"
     echo ""
     echo "✓ All examples work in API mode"
     echo "✓ All examples work in Gateway mode"

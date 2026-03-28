@@ -8,7 +8,6 @@ version = "0.1.0"
 description = "GCP Vertex AI Agent Engine example with agentsec (Cisco AI Defense) protection"
 authors = ["Cisco <ai-defense@cisco.com>"]
 readme = "README.md"
-package-mode = false
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.14"
@@ -17,13 +16,14 @@ python = ">=3.10,<3.14"
 cisco-aidefense-sdk = { path = "../../../..", develop = true }
 
 # Google Cloud AI libraries (both patched by agentsec)
-# - google-cloud-aiplatform: vertexai SDK (legacy but stable)
-# - google-genai: modern unified SDK (recommended, set GOOGLE_AI_SDK=google_genai)
+# - google-cloud-aiplatform: vertexai SDK (GOOGLE_AI_SDK=vertexai)
+# - google-genai: modern unified SDK (GOOGLE_AI_SDK=google_genai, default)
 google-cloud-aiplatform = ">=1.40.0"
 google-genai = ">=1.0.0"
 
 # LangChain for agent framework (similar to Strands in AWS)
 langchain = ">=0.3.0"
+langchain-google-genai = ">=2.0.0"
 langchain-google-vertexai = ">=2.0.0"
 langchain-core = ">=0.3.0"
 
